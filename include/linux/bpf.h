@@ -2785,7 +2785,10 @@ int bpf_prog_array_copy(struct bpf_prog_array *old_array,
 			struct bpf_prog_array **new_array);
 struct bpf_prog *bpf_prog_dummy(void);
 
-struct bpf_run_ctx {};
+struct bpf_run_ctx {
+	struct bpf_run_ctx *saved_run_ctx;
+	const struct bpf_prog *prog;
+};
 
 struct bpf_cg_run_ctx {
 	struct bpf_run_ctx run_ctx;
@@ -2803,7 +2806,6 @@ struct bpf_tramp_run_ctx {
 	struct bpf_run_ctx run_ctx;
 	u64 bpf_cookie;
 	int retval;
-	struct bpf_run_ctx *saved_run_ctx;
 };
 
 static inline struct bpf_run_ctx *bpf_set_run_ctx(struct bpf_run_ctx *new_ctx)
@@ -2812,7 +2814,12 @@ static inline struct bpf_run_ctx *bpf_set_run_ctx(struct bpf_run_ctx *new_ctx)
 
 #ifdef CONFIG_BPF_SYSCALL
 	old_ctx = current->bpf_ctx;
-	current->bpf_ctx = new_ctx;
+	if (new_ctx) {
+		new_ctx->saved_run_ctx = old_ctx;
+		new_ctx->prog = NULL;
+	}
+	barrier();
+	WRITE_ONCE(current->bpf_ctx, new_ctx);
 #endif
 	return old_ctx;
 }
@@ -2820,8 +2827,33 @@ static inline struct bpf_run_ctx *bpf_set_run_ctx(struct bpf_run_ctx *new_ctx)
 static inline void bpf_reset_run_ctx(struct bpf_run_ctx *old_ctx)
 {
 #ifdef CONFIG_BPF_SYSCALL
-	current->bpf_ctx = old_ctx;
+	WRITE_ONCE(current->bpf_ctx, old_ctx);
 #endif
+}
+
+static __always_inline bool
+bpf_prog_enter_recur_ctx(struct bpf_prog *prog, struct bpf_run_ctx *run_ctx)
+{
+	if (unlikely(prog->aux->jits_use_priv_stack))
+		return bpf_prog_get_recursion_context(prog);
+#ifdef CONFIG_BPF_SYSCALL
+	for (struct bpf_run_ctx *ctx = run_ctx->saved_run_ctx;
+	     ctx; ctx = ctx->saved_run_ctx) {
+		if (ctx->prog == prog)
+			return false;
+	}
+	WRITE_ONCE(run_ctx->prog, prog);
+#endif
+	return true;
+}
+
+static __always_inline void
+bpf_prog_exit_recur_ctx(struct bpf_prog *prog, struct bpf_run_ctx *run_ctx)
+{
+	if (unlikely(prog->aux->jits_use_priv_stack))
+		bpf_prog_put_recursion_context(prog);
+	else
+		WRITE_ONCE(run_ctx->prog, NULL);
 }
 
 /* BPF program asks to bypass CAP_NET_BIND_SERVICE in bind. */
@@ -3511,9 +3543,9 @@ bpf_prog_run_array_sleepable(const struct bpf_prog_array *array,
 			continue;
 		}
 
-		if (unlikely(!bpf_prog_get_recursion_context(prog))) {
+		if (unlikely(!bpf_prog_enter_recur_ctx(prog, &run_ctx.run_ctx))) {
 			bpf_prog_inc_misses_counter(prog);
-			bpf_prog_put_recursion_context(prog);
+			bpf_prog_exit_recur_ctx(prog, &run_ctx.run_ctx);
 			item++;
 			continue;
 		}
@@ -3527,7 +3559,7 @@ bpf_prog_run_array_sleepable(const struct bpf_prog_array *array,
 			ret &= run_prog(prog, ctx);
 		}
 
-		bpf_prog_put_recursion_context(prog);
+		bpf_prog_exit_recur_ctx(prog, &run_ctx.run_ctx);
 		item++;
 	}
 	bpf_reset_run_ctx(old_run_ctx);
