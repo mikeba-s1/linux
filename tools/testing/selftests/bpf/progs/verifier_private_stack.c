@@ -141,7 +141,7 @@ static unsigned long loop_callback(void)
 	: __clobber_common);
 }
 
-SEC("raw_tp")
+SEC("kprobe")
 __description("Private stack, callback")
 __success
 __arch_x86_64
@@ -200,83 +200,21 @@ __naked void private_stack_callback(void)
 }
 
 SEC("fentry/bpf_fentry_test9")
-__description("Private stack, exception in main prog")
+__description("No private stack, fentry")
 __success __retval(0)
 __arch_x86_64
-__jited("	pushq	%r9")
-__jited("...")
-__jited("	callq")
-__jited("	popq	%r9")
+__jited("	subq	$0x100, %rsp")
 __arch_arm64
-__jited("	stp	x29, x30, [sp, #-0x10]!")
-__jited("	mov	x29, sp")
-__jited("	stp	xzr, x26, [sp, #-0x10]!")
-__jited("	mov	x26, sp")
-__jited("	stp	x19, x20, [sp, #-0x10]!")
-__jited("	stp	x21, x22, [sp, #-0x10]!")
-__jited("	stp	x23, x24, [sp, #-0x10]!")
-__jited("	stp	x25, x26, [sp, #-0x10]!")
-__jited("	stp	x27, x28, [sp, #-0x10]!")
-__jited("	mov	x27, {{.*}}")
-__jited("	movk	x27, {{.*}}, lsl #16")
-__jited("	movk	x27, {{.*}}")
-__jited("	mrs	x10, TPIDR_EL{{[0-1]}}")
-__jited("	add	x27, x27, x10")
-__jited("	add	x25, x27, {{.*}}")
-__jited("	mov	x0, #0x2a")
-__jited("	str	x0, [x27]")
-__jited("	mov	x0, #0x0")
-__jited("	bl	0x{{.*}}")
-__jited("	mov	x8, x0")
-__jited("	ldp	x27, x28, [sp], #0x10")
-int private_stack_exception_main_prog(void)
+__jited("	mov	x25, sp")
+__jited("	sub	sp, sp, #0x100")
+__naked void no_private_stack_fentry(void)
 {
 	asm volatile ("			\
 	r1 = 42;			\
-	*(u64 *)(r10 - 512) = r1;	\
-"	::: __clobber_common);
-
-	bpf_throw(0);
-	return 0;
-}
-
-__used static int subprog_exception(void)
-{
-	bpf_throw(0);
-	return 0;
-}
-
-SEC("fentry/bpf_fentry_test9")
-__description("Private stack, exception in subprog")
-__success __retval(0)
-__arch_x86_64
-__jited("	movq	%rdi, -0x200(%r9)")
-__jited("	pushq	%r9")
-__jited("...")
-__jited("	callq")
-__jited("	popq	%r9")
-__arch_arm64
-__jited("	stp	x27, x28, [sp, #-0x10]!")
-__jited("	mov	x27, {{.*}}")
-__jited("	movk	x27, {{.*}}, lsl #16")
-__jited("	movk	x27, {{.*}}")
-__jited("	mrs	x10, TPIDR_EL{{[0-1]}}")
-__jited("	add	x27, x27, x10")
-__jited("	add	x25, x27, {{.*}}")
-__jited("	mov	x0, #0x2a")
-__jited("	str	x0, [x27]")
-__jited("	bl	0x{{.*}}")
-__jited("	mov	x8, x0")
-__jited("	ldp	x27, x28, [sp], #0x10")
-int private_stack_exception_sub_prog(void)
-{
-	asm volatile ("			\
-	r1 = 42;			\
-	*(u64 *)(r10 - 512) = r1;	\
-	call subprog_exception;		\
-"	::: __clobber_common);
-
-	return 0;
+	*(u64 *)(r10 - 256) = r1;	\
+	r0 = 0;				\
+	exit;				\
+"	::: __clobber_all);
 }
 
 int glob;
@@ -304,9 +242,9 @@ __noinline static int timer_cb2(void *map, int *key, struct bpf_timer *timer)
 	return 0;
 }
 
-SEC("fentry/bpf_fentry_test9")
+SEC("kprobe")
 __description("Private stack, async callback, not nested")
-__success __retval(0)
+__success
 __arch_x86_64
 __jited("	movabsq	$0x{{.*}}, %r9")
 __arch_arm64
@@ -329,9 +267,9 @@ int private_stack_async_callback_1(void)
 	return 0;
 }
 
-SEC("fentry/bpf_fentry_test9")
+SEC("kprobe")
 __description("Private stack, async callback, potential nesting")
-__success __retval(0)
+__success
 __load_if_JITed()
 __log_level(4) __msg("stack depth max 272")
 __msg("subprog 0 (private_stack_async_callback_2) main {{.*}} stack 8")
@@ -358,7 +296,7 @@ int private_stack_async_callback_2(void)
 	return 0;
 }
 
-SEC("fentry/bpf_fentry_test9")
+SEC("kprobe")
 __description("private stack, max stack depth is private stack")
 __success
 __log_level(4) __msg("stack depth max 256")
