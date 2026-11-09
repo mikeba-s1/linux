@@ -5470,9 +5470,13 @@ static enum priv_stack_mode bpf_enable_priv_stack(struct bpf_prog *prog)
 	if (!bpf_jit_supports_private_stack())
 		return NO_PRIV_STACK;
 
-	/* bpf_prog_check_recur() checks all prog types that use bpf trampoline
-	 * while kprobe/tp/perf_event/raw_tp don't use trampoline hence checked
-	 * explicitly.
+	/* A private stack is per CPU, so a program using one must never run
+	 * concurrently on one CPU. Kprobe, tracepoint, and perf_event programs
+	 * mostly run with preemption disabled. Where they do not (syscall
+	 * tracepoints), and for struct_ops programs that request a private
+	 * stack, recursion protection stays per CPU for programs that use one.
+	 * Tracing and raw_tp programs check recursion per task and may run
+	 * concurrently on one CPU, so they use the task's kernel stack.
 	 */
 	switch (prog->type) {
 	case BPF_PROG_TYPE_KPROBE:
@@ -5487,12 +5491,9 @@ static enum priv_stack_mode bpf_enable_priv_stack(struct bpf_prog *prog)
 		fallthrough;
 	case BPF_PROG_TYPE_TRACEPOINT:
 	case BPF_PROG_TYPE_PERF_EVENT:
-	case BPF_PROG_TYPE_RAW_TRACEPOINT:
 		return PRIV_STACK_ADAPTIVE;
-	case BPF_PROG_TYPE_TRACING:
-	case BPF_PROG_TYPE_LSM:
 	case BPF_PROG_TYPE_STRUCT_OPS:
-		if (prog->aux->priv_stack_requested || bpf_prog_check_recur(prog))
+		if (prog->aux->priv_stack_requested)
 			return PRIV_STACK_ADAPTIVE;
 		fallthrough;
 	default:
