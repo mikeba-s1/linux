@@ -2117,8 +2117,8 @@ void __bpf_trace_run(struct bpf_raw_tp_link *link, u64 *args)
 	struct srcu_ctr __percpu *scp = NULL;
 	struct bpf_prog *prog = link->link.prog;
 	bool sleepable = prog->sleepable;
-	struct bpf_run_ctx *old_run_ctx;
-	struct bpf_trace_run_ctx run_ctx;
+	/* Every field is set below: skip the automatic zero-fill. */
+	struct bpf_trace_run_ctx run_ctx __uninitialized;
 
 	if (sleepable) {
 		scp = rcu_read_lock_tasks_trace();
@@ -2127,19 +2127,22 @@ void __bpf_trace_run(struct bpf_raw_tp_link *link, u64 *args)
 		rcu_read_lock_dont_migrate();
 	}
 
-	if (unlikely(!bpf_prog_get_recursion_context(prog))) {
+	run_ctx.bpf_cookie = link->cookie;
+	run_ctx.is_uprobe = false;
+	/*
+	 * raw_tp and tp_btf programs never get a private stack, see
+	 * bpf_enable_priv_stack(), so the walk alone checks recursion.
+	 */
+	if (unlikely(!bpf_link_run_ctx(prog, &run_ctx.run_ctx))) {
 		bpf_prog_inc_misses_counter(prog);
 		goto out;
 	}
 
-	run_ctx.bpf_cookie = link->cookie;
-	old_run_ctx = bpf_set_run_ctx(&run_ctx.run_ctx);
-
 	(void)bpf_prog_run(prog, args);
 
-	bpf_reset_run_ctx(old_run_ctx);
+	/* The frame goes away with this function: no need to clear its prog. */
+	bpf_reset_run_ctx(run_ctx.run_ctx.saved_run_ctx);
 out:
-	bpf_prog_put_recursion_context(prog);
 
 	if (sleepable) {
 		migrate_enable();
