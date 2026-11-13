@@ -1939,6 +1939,10 @@ struct bpf_prog_aux {
 	bool exception_cb;
 	bool exception_boundary;
 	bool jits_use_priv_stack;
+	/* a sleepable run that keeps its per-CPU data safe with the per-CPU recursion counter */
+	bool pcpu_counter_guard;
+	/* an extension using per-CPU data: verified for a non-sleepable or a sleepable target */
+	u8 pcpu_ext_ctx;
 	bool priv_stack_requested;
 	bool changes_pkt_data;
 	bool has_prologue;
@@ -2831,6 +2835,11 @@ static inline struct bpf_run_ctx *bpf_set_run_ctx(struct bpf_run_ctx *new_ctx)
 	return old_ctx;
 }
 
+enum {
+	BPF_PCPU_EXT_GUARDED = 1,	/* guards: the target's runs cannot sleep */
+	BPF_PCPU_EXT_SLEEPABLE,		/* no guards: the target keeps the per-CPU counter */
+};
+
 /* End the non-preemptible section a run started for its per-CPU data, see bpf_pcpu_guard(). */
 static __always_inline void bpf_pcpu_guard_release(struct bpf_run_ctx *ctx)
 {
@@ -2856,7 +2865,7 @@ static inline void bpf_reset_run_ctx(struct bpf_run_ctx *old_ctx)
 static __always_inline bool
 bpf_prog_enter_recur_ctx(struct bpf_prog *prog, struct bpf_run_ctx *run_ctx)
 {
-	if (unlikely(prog->aux->jits_use_priv_stack))
+	if (unlikely(prog->aux->jits_use_priv_stack || prog->aux->pcpu_counter_guard))
 		return bpf_prog_get_recursion_context(prog);
 #ifdef CONFIG_BPF_SYSCALL
 	for (struct bpf_run_ctx *ctx = run_ctx->saved_run_ctx;
@@ -2873,7 +2882,7 @@ static __always_inline void
 bpf_prog_exit_recur_ctx(struct bpf_prog *prog, struct bpf_run_ctx *run_ctx)
 {
 	bpf_pcpu_guard_release(run_ctx);
-	if (unlikely(prog->aux->jits_use_priv_stack))
+	if (unlikely(prog->aux->jits_use_priv_stack || prog->aux->pcpu_counter_guard))
 		bpf_prog_put_recursion_context(prog);
 	else
 		WRITE_ONCE(run_ctx->prog, NULL);

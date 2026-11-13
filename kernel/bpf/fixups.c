@@ -2594,7 +2594,13 @@ static int div_by_const(const struct bpf_insn *insn, struct bpf_insn *buf)
  */
 static bool needs_pcpu_guard(const struct bpf_prog *prog)
 {
-	if (prog->sleepable || !prog->jit_requested || !bpf_jit_supports_pcpu_guard())
+	/* PREEMPT_RT: helpers may take sleeping spinlocks after the guard, keep the counter */
+	if (prog->sleepable || IS_ENABLED(CONFIG_PREEMPT_RT) || !prog->jit_requested ||
+	    !bpf_jit_supports_pcpu_guard())
+		return false;
+	/* runs inside a sleepable run, which may sleep after it: the target keeps the counter */
+	if (prog->type == BPF_PROG_TYPE_EXT && prog->aux->dst_prog &&
+	    prog->aux->dst_prog->sleepable)
 		return false;
 	switch (resolve_prog_type(prog)) {
 	case BPF_PROG_TYPE_TRACING:
@@ -2630,6 +2636,61 @@ static bool pcpu_guard_call(struct bpf_verifier_env *env, const struct bpf_insn 
 	default:
 		return false;
 	}
+}
+
+static bool pcpu_guard_site(struct bpf_verifier_env *env, const struct bpf_insn *insn, int i);
+
+/* Does the prog use per-CPU data or the timed may_goto budget, or (if asked) tail calls? */
+static bool uses_pcpu_state(struct bpf_verifier_env *env, bool tail_calls)
+{
+	struct bpf_prog *prog = env->prog;
+	int i;
+
+	for (i = 0; i < prog->len; i++) {
+		struct bpf_insn *insn = &prog->insnsi[i];
+
+		if (pcpu_guard_site(env, insn, i) || bpf_is_may_goto_insn(insn) ||
+		    (tail_calls && insn->code == (BPF_JMP | BPF_CALL) && !insn->src_reg &&
+		     insn->imm == BPF_FUNC_tail_call))
+			return true;
+		if (bpf_is_ldimm64(insn))
+			i++;
+	}
+	return false;
+}
+
+/*
+ * A run without a guard (sleepable, PREEMPT_RT, no JIT support) keeps the per-CPU recursion counter
+ * if it uses per-CPU data, the timed may_goto budget, or a tail call (prog arrays don't mix sleepable
+ * and non-sleepable programs, so its targets are run the same way), or has global subprogs an
+ * extension could replace.
+ */
+static bool needs_pcpu_counter(struct bpf_verifier_env *env)
+{
+	struct bpf_prog *prog = env->prog;
+	int i;
+
+	/* without a guard, see needs_pcpu_guard() */
+	if (!prog->sleepable && !IS_ENABLED(CONFIG_PREEMPT_RT) &&
+	    prog->jit_requested && bpf_jit_supports_pcpu_guard())
+		return false;
+	switch (resolve_prog_type(prog)) {
+	case BPF_PROG_TYPE_TRACING:
+		if (prog->expected_attach_type == BPF_TRACE_ITER)
+			return false;
+		break;
+	case BPF_PROG_TYPE_RAW_TRACEPOINT:
+	case BPF_PROG_TYPE_RAW_TRACEPOINT_WRITABLE:
+	case BPF_PROG_TYPE_TRACEPOINT:
+		break;
+	default:
+		return false;
+	}
+	/* an extension of a global function may use per-CPU data, see needs_pcpu_guard() */
+	for (i = 1; i < env->subprog_cnt; i++)
+		if (bpf_subprog_is_global(env, i))
+			return true;
+	return uses_pcpu_state(env, true);
 }
 
 /* Does bpf_do_misc_fixups() put a guard in front of insn 'i'? */
@@ -2714,6 +2775,12 @@ int bpf_do_misc_fixups(struct bpf_verifier_env *env)
 	bool timed_may_goto = prog->jit_requested && bpf_jit_supports_timed_may_goto();
 	struct bpf_timed_may_goto __percpu *tmg = NULL;
 	bool pcpu_guard = needs_pcpu_guard(prog);
+
+	prog->aux->pcpu_counter_guard = needs_pcpu_counter(env);
+	/* the attach checks that a new target matches, see bpf_check_attach_target() */
+	if (prog->type == BPF_PROG_TYPE_EXT && prog->aux->dst_prog && uses_pcpu_state(env, false))
+		prog->aux->pcpu_ext_ctx = prog->aux->dst_prog->sleepable ?
+					  BPF_PCPU_EXT_SLEEPABLE : BPF_PCPU_EXT_GUARDED;
 
 	if (env->seen_exception && !env->exception_callback_subprog) {
 		struct bpf_insn *patch = insn_buf;

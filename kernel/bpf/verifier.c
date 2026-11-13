@@ -24115,6 +24115,14 @@ int bpf_check_attach_target(struct bpf_verifier_log *log,
 					"Cannot extend a function that runs without RCU read lock\n");
 				return -EINVAL;
 			}
+			/* its per-CPU guards are for runs that cannot sleep, see bpf_pcpu_guard() */
+			if (prog->aux->pcpu_ext_ctx &&
+			    (prog->aux->pcpu_ext_ctx == BPF_PCPU_EXT_SLEEPABLE) !=
+			    tgt_prog->sleepable) {
+				bpf_log(log,
+					"Extension using per-CPU data was verified for another kind of target\n");
+				return -EINVAL;
+			}
 			tgt_changes_pkt_data = aux->func
 					       ? aux->func[subprog]->aux->changes_pkt_data
 					       : aux->changes_pkt_data;
