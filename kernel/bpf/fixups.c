@@ -2954,6 +2954,7 @@ int bpf_do_misc_fixups(struct bpf_verifier_env *env)
 		    insn->code == (BPF_LD | BPF_IMM | BPF_DW) &&
 		    (insn->src_reg == BPF_PSEUDO_MAP_VALUE ||
 		     insn->src_reg == BPF_PSEUDO_MAP_IDX_VALUE)) {
+			struct bpf_insn lo = insn[0], hi = insn[1];
 			struct bpf_map *map;
 
 			aux = &env->insn_aux_data[i];
@@ -2962,6 +2963,15 @@ int bpf_do_misc_fixups(struct bpf_verifier_env *env)
 				goto next_insn;
 
 			prog->jit_required = true;
+
+			/* This cpu's value, in a preemptible run: see bpf_pcpu_guard() */
+			if (pcpu_guard) {
+				insn_buf[0] = BPF_EMIT_CALL(arch_bpf_pcpu_guard);
+				insn_buf[1] = lo;
+				insn = bpf_patch_list_add(env, i, insn_buf, 2);
+				if (IS_ERR(insn))
+					return PTR_ERR(insn);
+			}
 
 			/*
 			 * We are *skipping* first half of ld_imm64 insn
@@ -2972,8 +2982,8 @@ int bpf_do_misc_fixups(struct bpf_verifier_env *env)
 			 * well for ld_imm64 insn.
 			 */
 
-			insn_buf[0] = insn[1];
-			insn_buf[1] = BPF_MOV64_PERCPU_REG(insn->dst_reg, insn->dst_reg);
+			insn_buf[0] = hi;
+			insn_buf[1] = BPF_MOV64_PERCPU_REG(lo.dst_reg, lo.dst_reg);
 			cnt = 2;
 
 			i++;
