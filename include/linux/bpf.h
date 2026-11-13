@@ -2794,6 +2794,8 @@ struct bpf_run_ctx {
 	const struct bpf_prog *prog;
 	/* set once this run has disabled preemption for its per-CPU data */
 	u32 pcpu_guard;
+	/* the timed may_goto budget of this invocation, if it keeps one */
+	void *timed_budget;
 };
 
 struct bpf_cg_run_ctx {
@@ -2824,6 +2826,7 @@ static inline struct bpf_run_ctx *bpf_set_run_ctx(struct bpf_run_ctx *new_ctx)
 		new_ctx->saved_run_ctx = old_ctx;
 		new_ctx->prog = NULL;
 		new_ctx->pcpu_guard = 0;
+		new_ctx->timed_budget = NULL;
 	}
 	/* Initialize the frame before interrupts and NMIs on this CPU see it. */
 	barrier();

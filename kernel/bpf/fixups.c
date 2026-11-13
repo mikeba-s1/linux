@@ -2338,21 +2338,20 @@ static int may_goto_expand(struct bpf_insn *insn_buf, int off, int reach,
 
 /*
  * Timed may_goto. All may_goto of a prog use one count and one timestamp: per-cpu memory of the
- * prog, set in the first insns of the main prog, and by the callers of async callbacks.
- * @reg holds the address. It is a register that is dead at the may_goto, or R0 that is saved at
- * @save_off in the stack. See may_goto_expand() for @off and @reach.
+ * prog, set in the first insns of the main prog, and by the callers of async callbacks; or, for
+ * progs whose runs have a frame, a budget of the invocation, see timed_budget_in_frame().
+ * @reg holds the address, computed by @addr. It is a register that is dead at the may_goto, or R0
+ * that is saved at @save_off in the stack. See may_goto_expand() for @off and @reach.
  */
 static int may_goto_expand_timed(struct bpf_insn *insn_buf, int off, int reach,
-				 struct bpf_timed_may_goto __percpu *tmg, int reg, int save_off)
+				 const struct bpf_insn *addr, int addr_cnt, int reg, int save_off)
 {
-	struct bpf_insn ld_tmg[] = { BPF_LD_IMM64(reg, (__force unsigned long)tmg) };
 	int cnt = 0, jmp, tail_cnt = save_off ? 6 : 5;
 
 	if (save_off)
 		insn_buf[cnt++] = BPF_STX_MEM(BPF_DW, BPF_REG_10, reg, save_off);
-	insn_buf[cnt++] = ld_tmg[0];
-	insn_buf[cnt++] = ld_tmg[1];
-	insn_buf[cnt++] = BPF_MOV64_PERCPU_REG(reg, reg);
+	memcpy(insn_buf + cnt, addr, addr_cnt * sizeof(*addr));
+	cnt += addr_cnt;
 	insn_buf[cnt++] = BPF_LDX_MEM(BPF_DW, BPF_REG_AX, reg, 0);
 	if (save_off) {
 		insn_buf[cnt++] = BPF_JMP_IMM(BPF_JNE, BPF_REG_AX, 0, 2);
@@ -2588,6 +2587,66 @@ static int div_by_const(const struct bpf_insn *insn, struct bpf_insn *buf)
 #endif
 
 /*
+ * The timed may_goto budget of these progs belongs to the invocation, not to the cpu: the main
+ * prog keeps it in its own stack and publishes its address in the run's frame, where subprogs and
+ * loop callbacks find it. Another task running the prog on this cpu has its own frame and budget,
+ * so a run spinning on may_goto needs no protection and stays preemptible. Not for progs with
+ * async callbacks: they and the subprogs they call run without a frame of their own. Not for
+ * extensions: they are functions of another prog's run.
+ */
+static bool timed_budget_in_frame(struct bpf_verifier_env *env)
+{
+#if defined(CONFIG_X86_64) && !defined(CONFIG_UML)
+	struct bpf_prog *prog = env->prog;
+	int k;
+
+	if (prog->type == BPF_PROG_TYPE_EXT || !prog->jit_requested ||
+	    !bpf_jit_supports_timed_may_goto() || !bpf_jit_supports_percpu_insn())
+		return false;
+	for (k = 0; k < env->subprog_cnt; k++)
+		if (env->subprog_info[k].is_async_cb)
+			return false;
+	switch (prog->type) {
+	case BPF_PROG_TYPE_TRACING:
+		return prog->expected_attach_type != BPF_TRACE_ITER;
+	case BPF_PROG_TYPE_RAW_TRACEPOINT:
+	case BPF_PROG_TYPE_RAW_TRACEPOINT_WRITABLE:
+	case BPF_PROG_TYPE_TRACEPOINT:
+		return true;
+	default:
+		return false;
+	}
+#else
+	return false;
+#endif
+}
+
+/* Is a timed may_goto of this prog a use of per-cpu data? */
+static bool may_goto_uses_pcpu(struct bpf_verifier_env *env)
+{
+	return env->prog->jit_requested && bpf_jit_supports_timed_may_goto() &&
+	       !timed_budget_in_frame(env);
+}
+
+/* Room for the invocation's budget in the main prog's stack, below the slot that saves R0 */
+#define TIMED_BUDGET_EXTRA	(8 + sizeof(struct bpf_timed_may_goto))
+
+/* Insns that put in @reg the address of the invocation's budget, from a subprog or callback */
+static int timed_budget_insns(struct bpf_insn *buf, int reg)
+{
+#if defined(CONFIG_X86_64) && !defined(CONFIG_UML)
+	buf[0] = BPF_MOV64_IMM(reg, (u32)(unsigned long)&current_task);
+	buf[1] = BPF_MOV64_PERCPU_REG(reg, reg);
+	buf[2] = BPF_LDX_MEM(BPF_DW, reg, reg, 0);
+	buf[3] = BPF_LDX_MEM(BPF_DW, reg, reg, offsetof(struct task_struct, bpf_ctx));
+	buf[4] = BPF_LDX_MEM(BPF_DW, reg, reg, offsetof(struct bpf_run_ctx, timed_budget));
+	return 5;
+#else
+	return 0;
+#endif
+}
+
+/*
  * Runs of these programs are preemptible and checked for recursion per task, so another task can
  * run the same program on this cpu while one is preempted. A run that uses per-CPU data first calls
  * bpf_pcpu_guard() to finish without preemption. Their runners always link a run frame.
@@ -2649,7 +2708,8 @@ static bool uses_pcpu_state(struct bpf_verifier_env *env, bool tail_calls)
 	for (i = 0; i < prog->len; i++) {
 		struct bpf_insn *insn = &prog->insnsi[i];
 
-		if (pcpu_guard_site(env, insn, i) || bpf_is_may_goto_insn(insn) ||
+		if (pcpu_guard_site(env, insn, i) ||
+		    (bpf_is_may_goto_insn(insn) && may_goto_uses_pcpu(env)) ||
 		    (tail_calls && insn->code == (BPF_JMP | BPF_CALL) && !insn->src_reg &&
 		     insn->imm == BPF_FUNC_tail_call))
 			return true;
@@ -2772,7 +2832,8 @@ static bool pcpu_access(struct bpf_verifier_env *env, int i, const bool *sub_acc
 	struct bpf_insn_aux_data *aux = &env->insn_aux_data[i];
 	int callee;
 
-	if (aux->pcpu_use || pcpu_guard_site(env, insn, i) || bpf_is_may_goto_insn(insn))
+	if (aux->pcpu_use || pcpu_guard_site(env, insn, i) ||
+	    (bpf_is_may_goto_insn(insn) && may_goto_uses_pcpu(env)))
 		return true;
 	if (insn->code != (BPF_JMP | BPF_CALL))
 		return false;
@@ -2896,6 +2957,7 @@ int bpf_do_misc_fixups(struct bpf_verifier_env *env)
 	bool timed_may_goto = prog->jit_requested && bpf_jit_supports_timed_may_goto();
 	struct bpf_timed_may_goto __percpu *tmg = NULL;
 	bool pcpu_guard = needs_pcpu_guard(prog);
+	bool frame_budget = false;
 
 	prog->aux->pcpu_counter_guard = needs_pcpu_counter(env);
 	/* the attach checks that a new target matches, see bpf_check_attach_target() */
@@ -2923,14 +2985,21 @@ int bpf_do_misc_fixups(struct bpf_verifier_env *env)
 	if (pcpu_guard) {
 		bool entry_guarded = false;
 
-		/* with timed may_goto, the main prog's first insns guard the run */
-		for (i = 0; timed_may_goto && i < env->prog->len; i++)
+		/* with a per-cpu timed budget, the main prog's first insns guard the run */
+		for (i = 0; may_goto_uses_pcpu(env) && i < env->prog->len; i++)
 			if (bpf_is_may_goto_insn(&env->prog->insnsi[i]))
 				entry_guarded = true;
 		ret = mark_pcpu_guarded(env, entry_guarded) ?: mark_pcpu_release(env);
 		if (ret)
 			return ret;
 	}
+
+	/* the main prog keeps the invocation's timed may_goto budget in its stack */
+	for (i = 0; timed_may_goto && timed_budget_in_frame(env) && i < env->prog->len; i++)
+		if (bpf_is_may_goto_insn(&env->prog->insnsi[i]))
+			frame_budget = true;
+	if (frame_budget)
+		stack_depth_extra = TIMED_BUDGET_EXTRA;
 
 	for (i = 0; i < insn_cnt;) {
 		/* the run's per-CPU section ends here, see mark_pcpu_release() */
@@ -3173,7 +3242,8 @@ int bpf_do_misc_fixups(struct bpf_verifier_env *env)
 
 		if (bpf_is_may_goto_insn(insn) && timed_may_goto) {
 			u16 live = env->insn_aux_data[i].live_regs_before;
-			int reg, save_off = 0;
+			int reg, addr_cnt, save_off = 0;
+			struct bpf_insn addr[5];
 
 			/* a register that is dead here holds the address of the count */
 			for (reg = BPF_REG_0; reg <= BPF_REG_9; reg++)
@@ -3182,7 +3252,7 @@ int bpf_do_misc_fixups(struct bpf_verifier_env *env)
 			if (reg > BPF_REG_9) {
 				reg = BPF_REG_0;
 				save_off = -stack_depth - 8;
-				stack_depth_extra = 8;
+				stack_depth_extra = max_t(u16, stack_depth_extra, 8);
 			}
 			if (!tmg) {
 				tmg = alloc_percpu_gfp(struct bpf_timed_may_goto,
@@ -3191,9 +3261,26 @@ int bpf_do_misc_fixups(struct bpf_verifier_env *env)
 					return -ENOMEM;
 				prog->aux->timed_may_goto = tmg;
 			}
+			if (frame_budget && !cur_subprog) {
+				/* the main prog's own stack, see timed_budget_in_frame() */
+				addr[0] = BPF_MOV64_REG(reg, BPF_REG_10);
+				addr[1] = BPF_ALU64_IMM(BPF_ADD, reg, -stack_depth - TIMED_BUDGET_EXTRA);
+				addr_cnt = 2;
+			} else if (frame_budget && !subprogs[cur_subprog].is_async_cb) {
+				addr_cnt = timed_budget_insns(addr, reg);
+			} else {
+				struct bpf_insn ld_tmg[] = {
+					BPF_LD_IMM64(reg, (__force unsigned long)tmg)
+				};
+
+				addr[0] = ld_tmg[0];
+				addr[1] = ld_tmg[1];
+				addr[2] = BPF_MOV64_PERCPU_REG(reg, reg);
+				addr_cnt = 3;
+			}
 			prog->jit_required = 1;
 			cnt = may_goto_expand_timed(insn_buf, insn->off, may_goto_off(env, insn, i),
-						    tmg, reg, save_off);
+						    addr, addr_cnt, reg, save_off);
 
 			insn = bpf_patch_list_add(env, i, insn_buf, cnt);
 			if (IS_ERR(insn))
@@ -3789,13 +3876,53 @@ next_insn:
 
 		if (timed_may_goto ? !main_prog && !loop_cb : !stack_slots)
 			continue;
-		if (stack_slots > 1) {
+		if (!timed_may_goto && stack_slots > 1) {
 			verifier_bug(env, "stack_slots supports may_goto only");
 			return -EFAULT;
 		}
 
 		cnt = 0;
 		stack_depth = subprogs[i].stack_depth;
+#if defined(CONFIG_X86_64) && !defined(CONFIG_UML)
+		if (frame_budget && main_prog) {
+			/* the budget at the bottom of the extra stack; publish it in the frame */
+			int count_off = offsetof(struct bpf_timed_may_goto, count);
+			int timestamp_off = offsetof(struct bpf_timed_may_goto, timestamp);
+			int owner_off = offsetof(struct bpf_timed_may_goto, owner);
+
+			insn_buf[cnt++] = BPF_ST_MEM(BPF_DW, BPF_REG_10, -stack_depth + count_off,
+						     BPF_MAX_TIMED_LOOPS);
+			insn_buf[cnt++] = BPF_ST_MEM(BPF_DW, BPF_REG_10, -stack_depth + timestamp_off, 0);
+			insn_buf[cnt++] = BPF_ST_MEM(BPF_DW, BPF_REG_10, -stack_depth + owner_off, 0);
+			insn_buf[cnt++] = BPF_MOV64_REG(BPF_REG_AX, BPF_REG_10);
+			insn_buf[cnt++] = BPF_ALU64_IMM(BPF_ADD, BPF_REG_AX, -stack_depth);
+			insn_buf[cnt++] = BPF_MOV64_IMM(BPF_REG_0, (u32)(unsigned long)&current_task);
+			insn_buf[cnt++] = BPF_MOV64_PERCPU_REG(BPF_REG_0, BPF_REG_0);
+			insn_buf[cnt++] = BPF_LDX_MEM(BPF_DW, BPF_REG_0, BPF_REG_0, 0);
+			insn_buf[cnt++] = BPF_LDX_MEM(BPF_DW, BPF_REG_0, BPF_REG_0,
+						      offsetof(struct task_struct, bpf_ctx));
+			insn_buf[cnt++] = BPF_JMP_IMM(BPF_JEQ, BPF_REG_0, 0, 1);
+			insn_buf[cnt++] = BPF_STX_MEM(BPF_DW, BPF_REG_0, BPF_REG_AX,
+						      offsetof(struct bpf_run_ctx, timed_budget));
+		} else if (frame_budget && loop_cb) {
+			/* the time is up: end the helper's loop, as below */
+			int count_off = offsetof(struct bpf_timed_may_goto, count);
+
+			insn_buf[cnt++] = BPF_MOV64_IMM(BPF_REG_0, (u32)(unsigned long)&current_task);
+			insn_buf[cnt++] = BPF_MOV64_PERCPU_REG(BPF_REG_0, BPF_REG_0);
+			insn_buf[cnt++] = BPF_LDX_MEM(BPF_DW, BPF_REG_0, BPF_REG_0, 0);
+			insn_buf[cnt++] = BPF_LDX_MEM(BPF_DW, BPF_REG_0, BPF_REG_0,
+						      offsetof(struct task_struct, bpf_ctx));
+			insn_buf[cnt++] = BPF_JMP_IMM(BPF_JEQ, BPF_REG_0, 0, 6);
+			insn_buf[cnt++] = BPF_LDX_MEM(BPF_DW, BPF_REG_0, BPF_REG_0,
+						      offsetof(struct bpf_run_ctx, timed_budget));
+			insn_buf[cnt++] = BPF_JMP_IMM(BPF_JEQ, BPF_REG_0, 0, 4);
+			insn_buf[cnt++] = BPF_LDX_MEM(BPF_DW, BPF_REG_0, BPF_REG_0, count_off);
+			insn_buf[cnt++] = BPF_JMP_IMM(BPF_JNE, BPF_REG_0, 0, 2);
+			insn_buf[cnt++] = BPF_MOV64_IMM(BPF_REG_0, 1);
+			insn_buf[cnt++] = BPF_EXIT_INSN();
+		} else
+#endif
 		if (timed_may_goto) {
 			struct bpf_insn ld_tmg[] = {
 				BPF_LD_IMM64(BPF_REG_0, (__force unsigned long)tmg)
@@ -3805,7 +3932,7 @@ next_insn:
 			int owner_off = offsetof(struct bpf_timed_may_goto, owner);
 
 			/* The budget is per-CPU data of a preemptible run, see bpf_pcpu_guard() */
-			if (main_prog && pcpu_guard) {
+			if (main_prog && pcpu_guard && !frame_budget) {
 				insn_buf[cnt++] = BPF_EMIT_CALL(arch_bpf_pcpu_guard);
 				prog->jit_required = true;
 			}
