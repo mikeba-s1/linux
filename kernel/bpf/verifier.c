@@ -4970,6 +4970,10 @@ static int check_map_access(struct bpf_verifier_env *env, struct bpf_reg_state *
 	if (err)
 		return err;
 
+	/* a load, store, atomic or helper argument that touches this cpu's value */
+	if (bpf_map_is_percpu_map(map->map_type))
+		env->insn_aux_data[env->insn_idx].pcpu_use = true;
+
 	if (IS_ERR_OR_NULL(map->record))
 		return 0;
 	rec = map->record;

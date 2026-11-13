@@ -2752,6 +2752,127 @@ static int mark_pcpu_guarded(struct bpf_verifier_env *env, bool entry_guarded)
 	return 0;
 }
 
+static int subprog_of(struct bpf_verifier_env *env, int insn)
+{
+	int k = 0;
+
+	while (k + 1 < env->subprog_cnt && env->subprog_info[k + 1].start <= insn)
+		k++;
+	return k;
+}
+
+/*
+ * Can insn 'i' touch per-CPU data, by itself or through what it calls or jumps to? A tail call,
+ * a global function (an extension may replace it) and a helper or kfunc that calls back into the
+ * prog are taken as yes; a static subprog is if its body can be (see mark_pcpu_release()).
+ */
+static bool pcpu_access(struct bpf_verifier_env *env, int i, const bool *sub_access)
+{
+	const struct bpf_insn *insn = &env->prog->insnsi[i];
+	struct bpf_insn_aux_data *aux = &env->insn_aux_data[i];
+	int callee;
+
+	if (aux->pcpu_use || pcpu_guard_site(env, insn, i) || bpf_is_may_goto_insn(insn))
+		return true;
+	if (insn->code != (BPF_JMP | BPF_CALL))
+		return false;
+	if (bpf_pseudo_call(insn)) {
+		callee = bpf_find_subprog(env, i + insn->imm + 1);
+		return callee < 0 || bpf_subprog_is_global(env, callee) || sub_access[callee];
+	}
+	return aux->calls_callback ||
+	       (!insn->src_reg && insn->imm == BPF_FUNC_tail_call);
+}
+
+/*
+ * End a run's per-CPU section after its last possible per-CPU access instead of at the end of the
+ * run: mark the insns of the main prog where no path can touch per-CPU data any more but a path
+ * coming in still could. Each run's section stays atomic with respect to other runs on the cpu.
+ * Not in extensions, subprogs and callbacks: their caller may still use per-CPU data, and a guard
+ * it does not repeat relies on the section going on. bpf_this_cpu_ptr()/bpf_per_cpu_ptr() return
+ * pointers whose uses are not tracked: such progs end the section at the end of the run.
+ */
+static int mark_pcpu_release(struct bpf_verifier_env *env)
+{
+	int len = env->prog->len, end, i, k, s;
+	struct bpf_insn *insns = env->prog->insnsi;
+	bool *sub_access, changed = true;
+	unsigned long *future;
+
+	if (env->prog->type == BPF_PROG_TYPE_EXT)
+		return 0;
+	for (i = 0; i < len; i++)
+		if (insns[i].code == (BPF_JMP | BPF_CALL) && !insns[i].src_reg &&
+		    (insns[i].imm == BPF_FUNC_this_cpu_ptr || insns[i].imm == BPF_FUNC_per_cpu_ptr))
+			return 0;
+
+	sub_access = kcalloc(env->subprog_cnt, sizeof(*sub_access), GFP_KERNEL_ACCOUNT);
+	future = bitmap_zalloc(len, GFP_KERNEL_ACCOUNT);
+	if (!sub_access || !future) {
+		kfree(sub_access);
+		bitmap_free(future);
+		return -ENOMEM;
+	}
+	/* which subprogs can touch per-CPU data, through the static call graph */
+	while (changed) {
+		changed = false;
+		for (i = 0; i < len; i++) {
+			k = subprog_of(env, i);
+			if (!sub_access[k] && pcpu_access(env, i, sub_access)) {
+				sub_access[k] = true;
+				changed = true;
+			}
+			if (bpf_is_ldimm64(&insns[i]))
+				i++;
+		}
+	}
+	/* backward: can a path from insn i of the main prog still touch per-CPU data? */
+	end = env->subprog_cnt > 1 ? env->subprog_info[1].start : len;
+	changed = true;
+	while (changed) {
+		changed = false;
+		for (i = end - 1; i >= 0; i--) {
+			struct bpf_iarray *succ;
+			bool f;
+
+			if (i > 0 && bpf_is_ldimm64(&insns[i - 1]))
+				continue;
+			f = pcpu_access(env, i, sub_access);
+			succ = bpf_insn_successors(env, i);
+			iarray_for_each(s, succ)
+				f |= test_bit(s, future);
+			if (f && !test_bit(i, future)) {
+				__set_bit(i, future);
+				changed = true;
+			}
+		}
+	}
+	/* release where the section ends: a predecessor could still touch per-CPU data */
+	for (i = 0; i < end; i++) {
+		struct bpf_iarray *succ;
+
+		if (bpf_is_ldimm64(&insns[i])) {
+			i++;
+			continue;
+		}
+		if (!test_bit(i, future))
+			continue;
+		succ = bpf_insn_successors(env, i);
+		iarray_for_each(s, succ) {
+			if (test_bit(s, future))
+				continue;
+			/* the runner ends the section at the exit anyway */
+			while (s < end && bpf_is_ldimm64(&insns[s]))
+				s += 2;
+			if (s < end && insns[s].code != (BPF_JMP | BPF_EXIT))
+				env->insn_aux_data[s].pcpu_release = true;
+		}
+	}
+	kfree(sub_access);
+	bitmap_free(future);
+	return 0;
+}
+
 /* Do various post-verification rewrites in a single program pass.
  * These rewrites simplify JIT and interpreter implementations.
  */
@@ -2806,12 +2927,20 @@ int bpf_do_misc_fixups(struct bpf_verifier_env *env)
 		for (i = 0; timed_may_goto && i < env->prog->len; i++)
 			if (bpf_is_may_goto_insn(&env->prog->insnsi[i]))
 				entry_guarded = true;
-		ret = mark_pcpu_guarded(env, entry_guarded);
+		ret = mark_pcpu_guarded(env, entry_guarded) ?: mark_pcpu_release(env);
 		if (ret)
 			return ret;
 	}
 
 	for (i = 0; i < insn_cnt;) {
+		/* the run's per-CPU section ends here, see mark_pcpu_release() */
+		if (pcpu_guard && env->insn_aux_data[i].pcpu_release) {
+			insn_buf[0] = BPF_EMIT_CALL(arch_bpf_pcpu_release);
+			insn_buf[1] = *insn;
+			insn = bpf_patch_list_add(env, i, insn_buf, 2);
+			if (IS_ERR(insn))
+				return PTR_ERR(insn);
+		}
 		if (is_addr_space_cast32(env->prog, insn)) {
 			/* convert to 32-bit mov that clears upper 32-bit */
 			insn->code = BPF_ALU | BPF_MOV | BPF_X;

@@ -1454,6 +1454,8 @@ u64 arch_bpf_timed_may_goto(void);
 u64 bpf_check_timed_may_goto(struct bpf_timed_may_goto *);
 u64 arch_bpf_pcpu_guard(void);
 void bpf_pcpu_guard(void);
+u64 arch_bpf_pcpu_release(void);
+void bpf_pcpu_release(void);
 void bpf_timed_may_goto_save(const struct bpf_prog *prog, struct bpf_timed_may_goto *saved);
 void bpf_timed_may_goto_restore(const struct bpf_prog *prog, struct bpf_timed_may_goto *saved);
 u64 bpf_prog_report_recursion(void);

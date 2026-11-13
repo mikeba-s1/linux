@@ -3971,6 +3971,22 @@ void notrace bpf_pcpu_guard(void)
 #endif
 }
 
+u64 __weak arch_bpf_pcpu_release(void)
+{
+	return 0;
+}
+
+/* The run will not touch per-CPU data again: end its non-preemptible section early. */
+void notrace bpf_pcpu_release(void)
+{
+#ifdef CONFIG_BPF_SYSCALL
+	struct bpf_run_ctx *ctx = current->bpf_ctx;
+
+	if (ctx)
+		bpf_pcpu_guard_release(ctx);
+#endif
+}
+
 static noinline void bpf_prog_report_may_goto_violation(void)
 {
 #ifdef CONFIG_BPF_SYSCALL

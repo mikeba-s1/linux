@@ -41,3 +41,37 @@ SYM_FUNC_START(arch_bpf_pcpu_guard)
 	leave
 	RET
 SYM_FUNC_END(arch_bpf_pcpu_guard)
+
+/* Same for the end of the run's per-CPU section, see mark_pcpu_release(). */
+SYM_FUNC_START(arch_bpf_pcpu_release)
+	ANNOTATE_NOENDBR
+
+	pushq %rbp
+	movq %rsp, %rbp
+
+	pushq %rax
+	pushq %rdi
+	pushq %rsi
+	pushq %rdx
+	pushq %rcx
+	pushq %r8
+	pushq %r9
+	pushq %r10
+	pushq %r11
+
+	CALL_DEPTH_ACCOUNT
+	call bpf_pcpu_release
+
+	popq %r11
+	popq %r10
+	popq %r9
+	popq %r8
+	popq %rcx
+	popq %rdx
+	popq %rsi
+	popq %rdi
+	popq %rax
+
+	leave
+	RET
+SYM_FUNC_END(arch_bpf_pcpu_release)
