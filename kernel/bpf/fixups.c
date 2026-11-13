@@ -2632,6 +2632,65 @@ static bool pcpu_guard_call(struct bpf_verifier_env *env, const struct bpf_insn 
 	}
 }
 
+/* Does bpf_do_misc_fixups() put a guard in front of insn 'i'? */
+static bool pcpu_guard_site(struct bpf_verifier_env *env, const struct bpf_insn *insn, int i)
+{
+	if (bpf_is_ldimm64(insn))
+		return bpf_jit_supports_percpu_insn() &&
+		       (insn->src_reg == BPF_PSEUDO_MAP_VALUE ||
+			insn->src_reg == BPF_PSEUDO_MAP_IDX_VALUE) &&
+		       env->used_maps[env->insn_aux_data[i].map_index]->map_type ==
+		       BPF_MAP_TYPE_PERCPU_ARRAY;
+	return insn->code == (BPF_JMP | BPF_CALL) && !insn->src_reg &&
+	       insn->off != BPF_KERNEL_CALL && pcpu_guard_call(env, insn, i);
+}
+
+/*
+ * The guard of a run only goes from clear to set. Mark the insns that every path from the entry
+ * of their subprog reaches through a guard: they need none. A forward "must" dataflow over the
+ * CFG; subprogs, callbacks and tail-call targets start unguarded.
+ */
+static int mark_pcpu_guarded(struct bpf_verifier_env *env, bool entry_guarded)
+{
+	int len = env->prog->len, i, k, s;
+	unsigned long *in, *next;
+	bool changed = true;
+
+	in = bitmap_alloc(len, GFP_KERNEL_ACCOUNT);
+	next = bitmap_alloc(len, GFP_KERNEL_ACCOUNT);
+	if (!in || !next) {
+		bitmap_free(in);
+		bitmap_free(next);
+		return -ENOMEM;
+	}
+	bitmap_fill(in, len);
+	while (changed) {
+		bitmap_fill(next, len);
+		for (k = 0; k < env->subprog_cnt; k++)
+			if (k || !entry_guarded)
+				__clear_bit(env->subprog_info[k].start, next);
+		for (i = 0; i < len; i++) {
+			struct bpf_insn *insn = &env->prog->insnsi[i];
+			struct bpf_iarray *succ;
+
+			if (!test_bit(i, in) && !pcpu_guard_site(env, insn, i)) {
+				succ = bpf_insn_successors(env, i);
+				iarray_for_each(s, succ)
+					__clear_bit(s, next);
+			}
+			if (bpf_is_ldimm64(insn))
+				i++;
+		}
+		changed = !bitmap_equal(in, next, len);
+		swap(in, next);
+	}
+	for (i = 0; i < len; i++)
+		env->insn_aux_data[i].pcpu_guarded = test_bit(i, in);
+	bitmap_free(in);
+	bitmap_free(next);
+	return 0;
+}
+
 /* Do various post-verification rewrites in a single program pass.
  * These rewrites simplify JIT and interpreter implementations.
  */
@@ -2671,6 +2730,18 @@ int bpf_do_misc_fixups(struct bpf_verifier_env *env)
 		env->exception_callback_subprog = env->subprog_cnt - 1;
 		/* Don't update insn_cnt, as add_hidden_subprog always appends insns */
 		bpf_mark_subprog_exc_cb(env, env->exception_callback_subprog);
+	}
+
+	if (pcpu_guard) {
+		bool entry_guarded = false;
+
+		/* with timed may_goto, the main prog's first insns guard the run */
+		for (i = 0; timed_may_goto && i < env->prog->len; i++)
+			if (bpf_is_may_goto_insn(&env->prog->insnsi[i]))
+				entry_guarded = true;
+		ret = mark_pcpu_guarded(env, entry_guarded);
+		if (ret)
+			return ret;
 	}
 
 	for (i = 0; i < insn_cnt;) {
@@ -2965,7 +3036,7 @@ int bpf_do_misc_fixups(struct bpf_verifier_env *env)
 			prog->jit_required = true;
 
 			/* This cpu's value, in a preemptible run: see bpf_pcpu_guard() */
-			if (pcpu_guard) {
+			if (pcpu_guard && !env->insn_aux_data[i].pcpu_guarded) {
 				insn_buf[0] = BPF_EMIT_CALL(arch_bpf_pcpu_guard);
 				insn_buf[1] = lo;
 				insn = bpf_patch_list_add(env, i, insn_buf, 2);
@@ -3019,7 +3090,8 @@ int bpf_do_misc_fixups(struct bpf_verifier_env *env)
 		 * Replace rather than insert: a jump to the call must land on the guard. Later
 		 * rewrites of the call replace the last insn of this patch.
 		 */
-		if (pcpu_guard && pcpu_guard_call(env, insn, i)) {
+		if (pcpu_guard && !env->insn_aux_data[i].pcpu_guarded &&
+		    pcpu_guard_call(env, insn, i)) {
 			insn_buf[0] = BPF_EMIT_CALL(arch_bpf_pcpu_guard);
 			insn_buf[1] = *insn;
 			prog->jit_required = true;
