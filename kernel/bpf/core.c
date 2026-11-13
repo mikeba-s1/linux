@@ -3940,6 +3940,37 @@ u64 __weak arch_bpf_timed_may_goto(void)
 	return 0;
 }
 
+bool __weak bpf_jit_supports_pcpu_guard(void)
+{
+	return false;
+}
+
+u64 __weak arch_bpf_pcpu_guard(void)
+{
+	return 0;
+}
+
+/*
+ * A run is about to use per-CPU data: a per-CPU map value or pointer, or the timed may_goto budget.
+ * Its runner lets other tasks run programs on this cpu while it is preempted, so make the rest of
+ * this run non-preemptible. The runner ends it, see bpf_pcpu_guard_release(). Interrupts and NMIs
+ * are not preempted, and code they run must not touch the frame of the task they interrupt.
+ */
+void notrace bpf_pcpu_guard(void)
+{
+#ifdef CONFIG_BPF_SYSCALL
+	struct bpf_run_ctx *ctx;
+
+	if (!in_task())
+		return;
+	ctx = current->bpf_ctx;
+	if (!ctx || ctx->pcpu_guard)
+		return;
+	preempt_disable();
+	ctx->pcpu_guard = 1;
+#endif
+}
+
 static noinline void bpf_prog_report_may_goto_violation(void)
 {
 #ifdef CONFIG_BPF_SYSCALL

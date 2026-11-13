@@ -2788,6 +2788,8 @@ struct bpf_prog *bpf_prog_dummy(void);
 struct bpf_run_ctx {
 	struct bpf_run_ctx *saved_run_ctx;
 	const struct bpf_prog *prog;
+	/* set once this run has disabled preemption for its per-CPU data */
+	u32 pcpu_guard;
 };
 
 struct bpf_cg_run_ctx {
@@ -2817,6 +2819,7 @@ static inline struct bpf_run_ctx *bpf_set_run_ctx(struct bpf_run_ctx *new_ctx)
 	if (new_ctx) {
 		new_ctx->saved_run_ctx = old_ctx;
 		new_ctx->prog = NULL;
+		new_ctx->pcpu_guard = 0;
 	}
 	/* Initialize the frame before interrupts and NMIs on this CPU see it. */
 	barrier();
@@ -2828,12 +2831,25 @@ static inline struct bpf_run_ctx *bpf_set_run_ctx(struct bpf_run_ctx *new_ctx)
 	return old_ctx;
 }
 
+/* End the non-preemptible section a run started for its per-CPU data, see bpf_pcpu_guard(). */
+static __always_inline void bpf_pcpu_guard_release(struct bpf_run_ctx *ctx)
+{
+	if (unlikely(ctx->pcpu_guard)) {
+		ctx->pcpu_guard = 0;
+		preempt_enable();
+	}
+}
+
 static inline void bpf_reset_run_ctx(struct bpf_run_ctx *old_ctx)
 {
 #ifdef CONFIG_BPF_SYSCALL
+	struct bpf_run_ctx *cur = READ_ONCE(current->bpf_ctx);
+
 	WRITE_ONCE(current->bpf_ctx, old_ctx);
 	/* Unlink the frame before its stack storage can be reused. */
 	barrier();
+	if (cur)
+		bpf_pcpu_guard_release(cur);
 #endif
 }
 
@@ -2856,6 +2872,7 @@ bpf_prog_enter_recur_ctx(struct bpf_prog *prog, struct bpf_run_ctx *run_ctx)
 static __always_inline void
 bpf_prog_exit_recur_ctx(struct bpf_prog *prog, struct bpf_run_ctx *run_ctx)
 {
+	bpf_pcpu_guard_release(run_ctx);
 	if (unlikely(prog->aux->jits_use_priv_stack))
 		bpf_prog_put_recursion_context(prog);
 	else

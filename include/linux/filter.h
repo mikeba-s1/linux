@@ -1399,6 +1399,7 @@ bool bpf_jit_supports_arena_stack(void);
 bool bpf_jit_supports_local_atomics(void);
 bool bpf_jit_supports_large_stack(void);
 bool bpf_jit_supports_timed_may_goto(void);
+bool bpf_jit_supports_pcpu_guard(void);
 bool bpf_jit_supports_fsession(void);
 
 /*
@@ -1451,6 +1452,8 @@ u64 bpf_arch_uaddress_limit(void);
 void arch_bpf_stack_walk(bool (*consume_fn)(void *cookie, u64 ip, u64 sp, u64 bp), void *cookie);
 u64 arch_bpf_timed_may_goto(void);
 u64 bpf_check_timed_may_goto(struct bpf_timed_may_goto *);
+u64 arch_bpf_pcpu_guard(void);
+void bpf_pcpu_guard(void);
 void bpf_timed_may_goto_save(const struct bpf_prog *prog, struct bpf_timed_may_goto *saved);
 void bpf_timed_may_goto_restore(const struct bpf_prog *prog, struct bpf_timed_may_goto *saved);
 u64 bpf_prog_report_recursion(void);

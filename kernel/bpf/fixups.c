@@ -2587,6 +2587,51 @@ static int div_by_const(const struct bpf_insn *insn, struct bpf_insn *buf)
 }
 #endif
 
+/*
+ * Runs of these programs are preemptible and checked for recursion per task, so another task can
+ * run the same program on this cpu while one is preempted. A run that uses per-CPU data first calls
+ * bpf_pcpu_guard() to finish without preemption. Their runners always link a run frame.
+ */
+static bool needs_pcpu_guard(const struct bpf_prog *prog)
+{
+	if (prog->sleepable || !prog->jit_requested || !bpf_jit_supports_pcpu_guard())
+		return false;
+	switch (resolve_prog_type(prog)) {
+	case BPF_PROG_TYPE_TRACING:
+		return prog->expected_attach_type != BPF_TRACE_ITER;
+	case BPF_PROG_TYPE_RAW_TRACEPOINT:
+	case BPF_PROG_TYPE_RAW_TRACEPOINT_WRITABLE:
+	case BPF_PROG_TYPE_TRACEPOINT:
+		return true;
+	default:
+		return false;
+	}
+}
+
+/* Does the helper call at insn 'i' return or use a pointer to this cpu's per-CPU data? */
+static bool pcpu_guard_call(struct bpf_verifier_env *env, const struct bpf_insn *insn, int i)
+{
+	struct bpf_insn_aux_data *aux = &env->insn_aux_data[i];
+	struct bpf_map *map;
+
+	switch (insn->imm) {
+	case BPF_FUNC_this_cpu_ptr:
+	case BPF_FUNC_per_cpu_ptr:
+		return true;
+	case BPF_FUNC_map_lookup_elem:
+	case BPF_FUNC_map_update_elem:
+	case BPF_FUNC_map_delete_elem:
+	case BPF_FUNC_for_each_map_elem:
+		/* more than one map reaches the call */
+		if (bpf_map_ptr_poisoned(aux))
+			return true;
+		map = aux->map_ptr_state.map_ptr;
+		return map && bpf_map_is_percpu_map(map->map_type);
+	default:
+		return false;
+	}
+}
+
 /* Do various post-verification rewrites in a single program pass.
  * These rewrites simplify JIT and interpreter implementations.
  */
@@ -2609,6 +2654,7 @@ int bpf_do_misc_fixups(struct bpf_verifier_env *env)
 	/* arch_bpf_timed_may_goto() takes and returns AX in a cpu register: for JITs only */
 	bool timed_may_goto = prog->jit_requested && bpf_jit_supports_timed_may_goto();
 	struct bpf_timed_may_goto __percpu *tmg = NULL;
+	bool pcpu_guard = needs_pcpu_guard(prog);
 
 	if (env->seen_exception && !env->exception_callback_subprog) {
 		struct bpf_insn *patch = insn_buf;
@@ -2957,6 +3003,19 @@ int bpf_do_misc_fixups(struct bpf_verifier_env *env)
 			if (IS_ERR(insn))
 				return PTR_ERR(insn);
 			goto next_insn;
+		}
+
+		/*
+		 * Replace rather than insert: a jump to the call must land on the guard. Later
+		 * rewrites of the call replace the last insn of this patch.
+		 */
+		if (pcpu_guard && pcpu_guard_call(env, insn, i)) {
+			insn_buf[0] = BPF_EMIT_CALL(arch_bpf_pcpu_guard);
+			insn_buf[1] = *insn;
+			prog->jit_required = true;
+			insn = bpf_patch_list_add(env, i, insn_buf, 2);
+			if (IS_ERR(insn))
+				return PTR_ERR(insn);
 		}
 
 		/* Skip inlining the helper call if the JIT does it. */
@@ -3467,6 +3526,11 @@ next_insn:
 			int timestamp_off = offsetof(struct bpf_timed_may_goto, timestamp);
 			int owner_off = offsetof(struct bpf_timed_may_goto, owner);
 
+			/* The budget is per-CPU data of a preemptible run, see bpf_pcpu_guard() */
+			if (main_prog && pcpu_guard) {
+				insn_buf[cnt++] = BPF_EMIT_CALL(arch_bpf_pcpu_guard);
+				prog->jit_required = true;
+			}
 			/* R0 has nothing at the entry */
 			insn_buf[cnt++] = ld_tmg[0];
 			insn_buf[cnt++] = ld_tmg[1];
