@@ -183,4 +183,6 @@ void test_percpu_preempt(void)
 		run_subtest("on_may_goto");
 	if (test__start_subtest("section_end"))
 		run_subtest("on_early");
+	if (test__start_subtest("dynptr"))
+		run_subtest("on_dynptr");
 }

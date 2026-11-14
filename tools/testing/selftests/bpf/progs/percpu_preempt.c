@@ -177,6 +177,35 @@ int on_throw(void *ctx)
 	return 0;
 }
 
+/* the buffer is written and read through a dynptr: the section runs to the end of the run */
+SEC("?raw_tp/task_rename")
+int on_dynptr(void *ctx)
+{
+	__u32 tid = (__u32)bpf_get_current_pid_tgid();
+	struct scratch_buf *b;
+	struct bpf_dynptr d;
+	__u64 v[8];
+	int zero = 0;
+
+	if (tid != tid_a && tid != tid_b)
+		return 0;
+	b = bpf_map_lookup_elem(&scratch, &zero);
+	if (!b || bpf_dynptr_from_mem(b, sizeof(*b), 0, &d))
+		return 0;
+	fill(v, tid);
+	bpf_dynptr_write(&d, 0, v, sizeof(v), 0);
+	if (tid != tid_a) {
+		runs_b++;
+		return 0;
+	}
+	runs_a++;
+	signal_b();
+	if (bpf_dynptr_read(v, sizeof(v), &d, 0, 0))
+		return 0;
+	check(v);
+	return 0;
+}
+
 /* only a counter is per-CPU data, at the start: the rest of the run may be preempted */
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
