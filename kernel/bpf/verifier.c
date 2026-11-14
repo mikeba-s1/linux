@@ -13106,6 +13106,21 @@ static int release_reg(struct bpf_verifier_env *env, struct bpf_reg_state *reg,
 	return err;
 }
 
+/*
+ * A helper or kfunc that gets a pointer to this cpu's value of a per-CPU map may keep a way to
+ * reach it after it returns (a dynptr, an untrusted cast), see mark_pcpu_release().
+ */
+static void mark_pcpu_args(struct bpf_verifier_env *env, int insn_idx)
+{
+	struct bpf_reg_state *regs = cur_regs(env);
+	int i;
+
+	for (i = BPF_REG_1; i <= BPF_REG_5; i++)
+		if (base_type(regs[i].type) == PTR_TO_MAP_VALUE && regs[i].map_ptr &&
+		    bpf_map_is_percpu_map(regs[i].map_ptr->map_type))
+			env->insn_aux_data[insn_idx].pcpu_arg = true;
+}
+
 static int check_helper_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			     int *insn_idx_p)
 {
@@ -13121,6 +13136,7 @@ static int check_helper_call(struct bpf_verifier_env *env, struct bpf_insn *insn
 	bool changes_data;
 	int i, err, func_id;
 
+	mark_pcpu_args(env, insn_idx);
 	/* find function prototype */
 	func_id = insn->imm;
 	err = bpf_get_helper_proto(env, insn->imm, &fn);
@@ -16025,6 +16041,7 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 	if (!insn->imm)
 		return 0;
 
+	mark_pcpu_args(env, insn_idx);
 	err = bpf_fetch_kfunc_arg_meta(env, insn->imm, insn->off, &meta);
 	if (err == -EACCES && meta.func_name) {
 		verbose(env, "calling kernel function %s is not allowed\n", meta.func_name);

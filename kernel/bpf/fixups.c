@@ -2862,10 +2862,18 @@ static int mark_pcpu_release(struct bpf_verifier_env *env)
 
 	if (env->prog->type == BPF_PROG_TYPE_EXT)
 		return 0;
-	for (i = 0; i < len; i++)
-		if (insns[i].code == (BPF_JMP | BPF_CALL) && !insns[i].src_reg &&
+	for (i = 0; i < len; i++) {
+		if (insns[i].code != (BPF_JMP | BPF_CALL))
+			continue;
+		if (!insns[i].src_reg &&
 		    (insns[i].imm == BPF_FUNC_this_cpu_ptr || insns[i].imm == BPF_FUNC_per_cpu_ptr))
 			return 0;
+		/* a dynptr or a cast can reach this cpu's value later, without a marked access */
+		if (env->insn_aux_data[i].pcpu_arg &&
+		    (insns[i].src_reg == BPF_PSEUDO_KFUNC_CALL ||
+		     (!insns[i].src_reg && insns[i].imm == BPF_FUNC_dynptr_from_mem)))
+			return 0;
+	}
 
 	sub_access = kcalloc(env->subprog_cnt, sizeof(*sub_access), GFP_KERNEL_ACCOUNT);
 	future = bitmap_zalloc(len, GFP_KERNEL_ACCOUNT);

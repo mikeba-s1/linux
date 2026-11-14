@@ -893,6 +893,7 @@ struct bpf_insn_aux_data {
 	u64 non_stack_access:1; /* instruction can access non-stack memory */
 	u64 pcpu_guarded:1; /* every path to it has called bpf_pcpu_guard() in this run */
 	u64 pcpu_use:1; /* reads or writes this cpu's value of a per-CPU map */
+	u64 pcpu_arg:1; /* a helper or kfunc gets a pointer to this cpu's value of a per-CPU map */
 	u64 pcpu_release:1; /* the run's per-CPU section has ended on every path here */
 	/* true if some jump or call instruction targets this instruction */
 	u64 jump_target:1;
