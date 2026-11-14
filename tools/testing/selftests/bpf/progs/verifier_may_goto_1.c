@@ -80,7 +80,8 @@ __naked void may_goto_batch_1(void)
 	: __clobber_all);
 }
 
-SEC("raw_tp")
+/* runs of tc programs have no frame: the timed budget stays per-cpu */
+SEC("tc")
 __description("may_goto batch with offsets 2/0")
 __load_if_JITed()
 __arch_x86_64
