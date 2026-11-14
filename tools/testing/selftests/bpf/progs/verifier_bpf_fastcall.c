@@ -900,7 +900,8 @@ __naked void unconditional_jump_to_fill(void)
 	: __clobber_all);
 }
 
-SEC("raw_tp")
+/* runs of tc programs have no frame: the may_goto budget stays per-cpu */
+SEC("tc")
 __arch_x86_64
 __log_level(4)
 __msg("subprog 0 (may_goto_interaction_x86_64) main {{.*}} stack 8")
@@ -927,6 +928,49 @@ __xlated("20: *(u64 *)(r10 -8) = r1")
 __xlated("21: exit")
 __success
 __naked void may_goto_interaction_x86_64(void)
+{
+	asm volatile (
+	"r1 = 1;"
+	"*(u64 *)(r10 - 16) = r1;"
+	"call %[bpf_get_smp_processor_id];"
+	"r1 = *(u64 *)(r10 - 16);"
+	".8byte %[may_goto];"
+	/* just touch some stack at -8 */
+	"*(u64 *)(r10 - 8) = r1;"
+	"exit;"
+	:
+	: __imm(bpf_get_smp_processor_id),
+	  __imm_insn(may_goto, BPF_RAW_INSN(BPF_JMP | BPF_JCOND, 0, 0, +1 /* offset */, 0))
+	: __clobber_all);
+}
+
+/*
+ * Runs of raw_tp programs have a frame: the budget is in the main prog's stack, published in the
+ * frame for subprogs and callbacks, and the may_goto addresses it from r10.
+ */
+SEC("raw_tp")
+__arch_x86_64
+__log_level(4)
+__msg("subprog 0 (may_goto_frame_budget_x86_64) main {{.*}} stack 40")
+/* may_goto counter and timestamp in the stack */
+__xlated("0: *(u64 *)(r10 -40) = 65535")
+__xlated("1: *(u64 *)(r10 -32) = 0")
+__xlated("2: *(u64 *)(r10 -24) = 0")
+__xlated("3: r13 = r10")
+__xlated("4: r13 += -40")
+__xlated("...")
+/* may_goto expansion starts, r0 and r1 are live */
+__xlated("r2 = r10")
+__xlated("r2 += -40")
+__xlated("r13 = *(u64 *)(r2 +0)")
+__xlated("...")
+__xlated("call unknown")
+__xlated("*(u64 *)(r2 +0) = r13")
+/* may_goto expansion ends */
+__xlated("*(u64 *)(r10 -8) = r1")
+__xlated("exit")
+__success
+__naked void may_goto_frame_budget_x86_64(void)
 {
 	asm volatile (
 	"r1 = 1;"
