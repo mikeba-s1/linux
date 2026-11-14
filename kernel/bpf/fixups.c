@@ -2683,6 +2683,13 @@ static bool pcpu_guard_call(struct bpf_verifier_env *env, const struct bpf_insn 
 	switch (insn->imm) {
 	case BPF_FUNC_this_cpu_ptr:
 	case BPF_FUNC_per_cpu_ptr:
+	/*
+	 * They take a per-CPU nesting slot (bpf_raw_tp_regs, perf sample data) for the duration of
+	 * the call: two tasks preempting each other inside them would hand out the same slot.
+	 */
+	case BPF_FUNC_perf_event_output:
+	case BPF_FUNC_get_stackid:
+	case BPF_FUNC_get_stack:
 		return true;
 	case BPF_FUNC_map_lookup_elem:
 	case BPF_FUNC_map_update_elem:
