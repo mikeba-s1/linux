@@ -2639,8 +2639,9 @@ static int timed_budget_insns(struct bpf_insn *buf, int reg)
 	buf[1] = BPF_MOV64_PERCPU_REG(reg, reg);
 	buf[2] = BPF_LDX_MEM(BPF_DW, reg, reg, 0);
 	buf[3] = BPF_LDX_MEM(BPF_DW, reg, reg, offsetof(struct task_struct, bpf_ctx));
-	buf[4] = BPF_LDX_MEM(BPF_DW, reg, reg, offsetof(struct bpf_run_ctx, timed_budget));
-	return 5;
+	buf[4] = BPF_LDX_MEM(BPF_DW, reg, reg, offsetof(struct bpf_run_ctx, pcpu_state));
+	buf[5] = BPF_ALU64_IMM(BPF_AND, reg, (s32)~BPF_PCPU_GUARD);
+	return 6;
 #else
 	return 0;
 #endif
@@ -3251,7 +3252,7 @@ int bpf_do_misc_fixups(struct bpf_verifier_env *env)
 		if (bpf_is_may_goto_insn(insn) && timed_may_goto) {
 			u16 live = env->insn_aux_data[i].live_regs_before;
 			int reg, addr_cnt, save_off = 0;
-			struct bpf_insn addr[5];
+			struct bpf_insn addr[6];
 
 			/* a register that is dead here holds the address of the count */
 			for (reg = BPF_REG_0; reg <= BPF_REG_9; reg++)
@@ -3909,9 +3910,14 @@ next_insn:
 			insn_buf[cnt++] = BPF_LDX_MEM(BPF_DW, BPF_REG_0, BPF_REG_0, 0);
 			insn_buf[cnt++] = BPF_LDX_MEM(BPF_DW, BPF_REG_0, BPF_REG_0,
 						      offsetof(struct task_struct, bpf_ctx));
-			insn_buf[cnt++] = BPF_JMP_IMM(BPF_JEQ, BPF_REG_0, 0, 1);
-			insn_buf[cnt++] = BPF_STX_MEM(BPF_DW, BPF_REG_0, BPF_REG_AX,
-						      offsetof(struct bpf_run_ctx, timed_budget));
+			/* R2 has nothing at the entry either; keep the guard bit */
+			insn_buf[cnt++] = BPF_JMP_IMM(BPF_JEQ, BPF_REG_0, 0, 4);
+			insn_buf[cnt++] = BPF_LDX_MEM(BPF_DW, BPF_REG_2, BPF_REG_0,
+						      offsetof(struct bpf_run_ctx, pcpu_state));
+			insn_buf[cnt++] = BPF_ALU64_IMM(BPF_AND, BPF_REG_2, BPF_PCPU_GUARD);
+			insn_buf[cnt++] = BPF_ALU64_REG(BPF_OR, BPF_REG_2, BPF_REG_AX);
+			insn_buf[cnt++] = BPF_STX_MEM(BPF_DW, BPF_REG_0, BPF_REG_2,
+						      offsetof(struct bpf_run_ctx, pcpu_state));
 		} else if (frame_budget && loop_cb) {
 			/* the time is up: end the helper's loop, as below */
 			int count_off = offsetof(struct bpf_timed_may_goto, count);
@@ -3921,9 +3927,10 @@ next_insn:
 			insn_buf[cnt++] = BPF_LDX_MEM(BPF_DW, BPF_REG_0, BPF_REG_0, 0);
 			insn_buf[cnt++] = BPF_LDX_MEM(BPF_DW, BPF_REG_0, BPF_REG_0,
 						      offsetof(struct task_struct, bpf_ctx));
-			insn_buf[cnt++] = BPF_JMP_IMM(BPF_JEQ, BPF_REG_0, 0, 6);
+			insn_buf[cnt++] = BPF_JMP_IMM(BPF_JEQ, BPF_REG_0, 0, 7);
 			insn_buf[cnt++] = BPF_LDX_MEM(BPF_DW, BPF_REG_0, BPF_REG_0,
-						      offsetof(struct bpf_run_ctx, timed_budget));
+						      offsetof(struct bpf_run_ctx, pcpu_state));
+			insn_buf[cnt++] = BPF_ALU64_IMM(BPF_AND, BPF_REG_0, (s32)~BPF_PCPU_GUARD);
 			insn_buf[cnt++] = BPF_JMP_IMM(BPF_JEQ, BPF_REG_0, 0, 4);
 			insn_buf[cnt++] = BPF_LDX_MEM(BPF_DW, BPF_REG_0, BPF_REG_0, count_off);
 			insn_buf[cnt++] = BPF_JMP_IMM(BPF_JNE, BPF_REG_0, 0, 2);

@@ -3964,10 +3964,10 @@ void notrace bpf_pcpu_guard(void)
 	if (!in_task())
 		return;
 	ctx = current->bpf_ctx;
-	if (!ctx || ctx->pcpu_guard)
+	if (!ctx || (ctx->pcpu_state & BPF_PCPU_GUARD))
 		return;
 	preempt_disable();
-	ctx->pcpu_guard = 1;
+	ctx->pcpu_state |= BPF_PCPU_GUARD;
 #endif
 }
 
