@@ -177,6 +177,38 @@ int on_throw(void *ctx)
 	return 0;
 }
 
+/* only a counter is per-CPU data, at the start: the rest of the run may be preempted */
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, int);
+	__type(value, __u64);
+} cnt SEC(".maps");
+
+SEC("?raw_tp/task_rename")
+int on_early(void *ctx)
+{
+	__u32 tid = (__u32)bpf_get_current_pid_tgid();
+	int runs_b_before, zero = 0;
+	__u64 *v;
+
+	if (tid != tid_a && tid != tid_b)
+		return 0;
+	v = bpf_map_lookup_elem(&cnt, &zero);
+	if (v)
+		(*v)++;
+	if (tid != tid_a) {
+		runs_b++;
+		return 0;
+	}
+	runs_a++;
+	runs_b_before = *(volatile int *)&runs_b;
+	signal_b();
+	if (*(volatile int *)&runs_b != runs_b_before)
+		b_inside_a++;
+	return 0;
+}
+
 #define timed_can_loop ({ __label__ l_break, l_continue; bool ret = true;	\
 	asm volatile goto("may_goto %l[l_break]" :::: l_break);			\
 	goto l_continue;							\

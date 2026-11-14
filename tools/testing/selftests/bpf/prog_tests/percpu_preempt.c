@@ -67,6 +67,21 @@ static __u64 recursion_misses(struct bpf_program *prog)
 	return info.recursion_misses;
 }
 
+static __u64 counter_sum(struct percpu_preempt *skel)
+{
+	int ncpus = libbpf_num_possible_cpus(), zero = 0;
+	__u64 sum = 0, *vals;
+
+	if (ncpus <= 0)
+		return -1ULL;
+	vals = calloc(ncpus, sizeof(*vals));
+	if (vals && !bpf_map_lookup_elem(bpf_map__fd(skel->maps.cnt), &zero, vals))
+		for (int i = 0; i < ncpus; i++)
+			sum += vals[i];
+	free(vals);
+	return sum;
+}
+
 static void run_subtest(const char *name)
 {
 	struct ctx c = { .cpu = sched_getcpu() };
@@ -120,13 +135,22 @@ static void run_subtest(const char *name)
 	ASSERT_EQ(skel->bss->runs_a, NR_ROUNDS, "runs_a");
 	ASSERT_EQ(c.renames_b, NR_ROUNDS, "renames_b");
 	ASSERT_EQ(skel->bss->corrupted, 0, "corrupted");
-	ASSERT_EQ(skel->bss->b_inside_a, 0, "b_inside_a");
 	ASSERT_EQ(skel->bss->runs_b, NR_ROUNDS, "runs_b");
 	ASSERT_EQ(recursion_misses(prog), 0, "recursion_misses");
+	if (prog == skel->progs.on_early) {
+		/* A's per-CPU section ended before it let B in */
+		ASSERT_EQ(skel->bss->b_inside_a, NR_ROUNDS, "b_inside_a");
+		ASSERT_EQ(counter_sum(skel), 2 * NR_ROUNDS, "counter");
+	} else if (prog == skel->progs.on_may_goto) {
+		/* the budget is the invocation's: B neither waits for A's loop nor renews it */
+		ASSERT_EQ(skel->bss->b_inside_a, NR_ROUNDS, "b_inside_a");
+		ASSERT_LT(skel->bss->a_spin_ns, 300 * 1000 * 1000ULL, "may_goto time slice");
+	} else {
+		/* B ran after A's per-CPU section */
+		ASSERT_EQ(skel->bss->b_inside_a, 0, "b_inside_a");
+	}
 	if (prog == skel->progs.on_throw)
 		ASSERT_EQ(skel->bss->thrown, 2 * NR_ROUNDS, "thrown");
-	if (prog == skel->progs.on_may_goto)
-		ASSERT_LT(skel->bss->a_spin_ns, 300 * 1000 * 1000ULL, "may_goto time slice");
 restore:
 	c.stop = 1;
 	if (started)
@@ -138,6 +162,11 @@ out:
 
 void test_percpu_preempt(void)
 {
+#if !defined(__x86_64__)
+	/* other architectures keep the per-CPU recursion counter: B is dropped */
+	test__skip();
+	return;
+#endif
 	if (test__start_subtest("raw_tp"))
 		run_subtest("on_raw_tp");
 	if (test__start_subtest("fentry"))
@@ -152,4 +181,6 @@ void test_percpu_preempt(void)
 		run_subtest("on_throw");
 	if (test__start_subtest("may_goto"))
 		run_subtest("on_may_goto");
+	if (test__start_subtest("section_end"))
+		run_subtest("on_early");
 }
