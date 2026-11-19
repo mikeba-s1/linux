@@ -2366,7 +2366,7 @@ struct bpf_struct_ops_common_value {
 	enum bpf_struct_ops_state state;
 };
 
-static inline bool bpf_prog_get_recursion_context(struct bpf_prog *prog)
+static inline bool bpf_prog_get_recursion_percpu(struct bpf_prog *prog)
 {
 #ifdef CONFIG_ARM64
 	u8 rctx = interrupt_context_level();
@@ -2386,7 +2386,7 @@ static inline bool bpf_prog_get_recursion_context(struct bpf_prog *prog)
 #endif
 }
 
-static inline void bpf_prog_put_recursion_context(struct bpf_prog *prog)
+static inline void bpf_prog_put_recursion_percpu(struct bpf_prog *prog)
 {
 #ifdef CONFIG_ARM64
 	u8 rctx = interrupt_context_level();
@@ -2397,6 +2397,65 @@ static inline void bpf_prog_put_recursion_context(struct bpf_prog *prog)
 	preempt_enable();
 #else
 	this_cpu_dec(*(int __percpu *)(prog->active));
+#endif
+}
+
+/*
+ * Enter @prog, unless that would be recursion:
+ *
+ * - A program that keeps per-CPU state (prog->recur_per_cpu) takes the per-CPU
+ *   counter. No other run of it starts on this CPU until it exits.
+ * - Any other program recurses only if the current task is already inside it:
+ *   it is in the task's array. Interrupts and NMIs push on top of the entries
+ *   of the task they interrupt, so they are covered too.
+ *
+ * Returns false if @prog must not run. Call bpf_prog_put_recursion_context()
+ * either way.
+ *
+ * Slots at and above the depth are NULL. The depth is raised before the slot
+ * is filled, so an interrupt in between pushes above the slot and reads NULL
+ * in it. A program nested deeper than the array is not run.
+ */
+static __always_inline bool bpf_prog_get_recursion_context(struct bpf_prog *prog)
+{
+#ifdef CONFIG_BPF_SYSCALL
+	struct task_struct *tsk = current;
+	unsigned int depth, i;
+	bool ok;
+
+	if (prog->recur_per_cpu)
+		return bpf_prog_get_recursion_percpu(prog);
+
+	depth = READ_ONCE(tsk->bpf_recur_depth);
+	ok = depth < ARRAY_SIZE(tsk->bpf_recur_progs);
+	for (i = 0; ok && i < depth; i++)
+		ok = READ_ONCE(tsk->bpf_recur_progs[i]) != prog;
+	WRITE_ONCE(tsk->bpf_recur_depth, depth + 1);
+	if (ok)
+		WRITE_ONCE(tsk->bpf_recur_progs[depth], prog);
+	return ok;
+#else
+	return bpf_prog_get_recursion_percpu(prog);
+#endif
+}
+
+static __always_inline void bpf_prog_put_recursion_context(struct bpf_prog *prog)
+{
+#ifdef CONFIG_BPF_SYSCALL
+	struct task_struct *tsk = current;
+	unsigned int depth;
+
+	if (prog->recur_per_cpu) {
+		bpf_prog_put_recursion_percpu(prog);
+		return;
+	}
+
+	depth = READ_ONCE(tsk->bpf_recur_depth) - 1;
+	if (depth < ARRAY_SIZE(tsk->bpf_recur_progs))
+		WRITE_ONCE(tsk->bpf_recur_progs[depth], NULL);
+	WRITE_ONCE(tsk->bpf_recur_depth, depth);
+#else
+	bpf_prog_put_recursion_percpu(prog);
 #endif
 }
 
