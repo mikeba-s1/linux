@@ -61,6 +61,7 @@ struct bio_list;
 struct blk_plug;
 struct bpf_local_storage;
 struct bpf_run_ctx;
+struct bpf_prog;
 struct bpf_net_context;
 struct capture_control;
 struct cfs_rq;
@@ -1632,6 +1633,9 @@ struct task_struct {
 	struct bpf_local_storage __rcu	*bpf_storage;
 	/* Used for BPF run context */
 	struct bpf_run_ctx		*bpf_ctx;
+	/* The programs this task is inside, for those whose recursion is checked per task */
+	const struct bpf_prog		*bpf_recur_progs[4];
+	unsigned int			bpf_recur_depth;
 #endif
 	/* Used by BPF for per-TASK xdp storage */
 	struct bpf_net_context		*bpf_net_context;
