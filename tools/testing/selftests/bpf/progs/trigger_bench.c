@@ -107,6 +107,50 @@ int trigger_driver_kfunc(void *ctx)
 	return 0;
 }
 
+/*
+ * trig-fentry-nest3 and trig-rawtp-nest3: the benchmarked program starts with
+ * three programs already running in the task.
+ *
+ *   trigger_driver_nest             calls bpf_ktime_get_boot_ns() once
+ *   bench_nest_level2, fentry on it calls bpf_ktime_get_tai_ns() once
+ *   bench_nest_level3, fentry on it runs the loop that fires the benchmarked program
+ */
+SEC("?raw_tp")
+int trigger_driver_nest(void *ctx)
+{
+	(void)bpf_ktime_get_boot_ns();
+	return 0;
+}
+
+SEC("?fentry/bpf_ktime_get_boot_ns")
+int bench_nest_level2(void *ctx)
+{
+	(void)bpf_ktime_get_tai_ns();
+	return 0;
+}
+
+SEC("?fentry/bpf_ktime_get_tai_ns")
+int bench_nest_level3(void *ctx)
+{
+	int i;
+
+	for (i = 0; i < batch_iters; i++)
+		(void)bpf_get_numa_node_id(); /* attach point for benchmarking */
+
+	return 0;
+}
+
+SEC("?fentry/bpf_ktime_get_tai_ns")
+int bench_nest_level3_tp(void *ctx)
+{
+	int i;
+
+	for (i = 0; i < batch_iters; i++)
+		(void)bpf_modify_return_test_tp(0); /* attach point for benchmarking */
+
+	return 0;
+}
+
 SEC("?kprobe/bpf_get_numa_node_id")
 int bench_trigger_kprobe(void *ctx)
 {

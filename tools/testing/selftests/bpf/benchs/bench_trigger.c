@@ -227,6 +227,37 @@ static void trigger_fentry_setup(void)
 	attach_bpf(ctx.skel->progs.bench_trigger_fentry);
 }
 
+/* The benchmarked program starts three programs deep, see progs/trigger_bench.c */
+static void setup_nest3(bool rawtp)
+{
+	struct bpf_program *level3, *prog;
+
+	setup_ctx();
+	level3 = rawtp ? ctx.skel->progs.bench_nest_level3_tp : ctx.skel->progs.bench_nest_level3;
+	prog = rawtp ? ctx.skel->progs.bench_trigger_rawtp : ctx.skel->progs.bench_trigger_fentry;
+	bpf_program__set_autoload(ctx.skel->progs.trigger_driver, false);
+	bpf_program__set_autoload(ctx.skel->progs.trigger_driver_nest, true);
+	bpf_program__set_autoload(ctx.skel->progs.bench_nest_level2, true);
+	bpf_program__set_autoload(level3, true);
+	bpf_program__set_autoload(prog, true);
+	load_ctx();
+	/* override driver program */
+	ctx.driver_prog_fd = bpf_program__fd(ctx.skel->progs.trigger_driver_nest);
+	attach_bpf(ctx.skel->progs.bench_nest_level2);
+	attach_bpf(level3);
+	attach_bpf(prog);
+}
+
+static void trigger_fentry_nest3_setup(void)
+{
+	setup_nest3(false);
+}
+
+static void trigger_rawtp_nest3_setup(void)
+{
+	setup_nest3(true);
+}
+
 static void attach_ksyms_all(struct bpf_program *empty, bool kretprobe)
 {
 	LIBBPF_OPTS(bpf_kprobe_multi_opts, opts);
@@ -638,6 +669,8 @@ BENCH_TRIG_KERNEL(fexit, "fexit");
 BENCH_TRIG_KERNEL(fmodret, "fmodret");
 BENCH_TRIG_KERNEL(tp, "tp");
 BENCH_TRIG_KERNEL(rawtp, "rawtp");
+BENCH_TRIG_KERNEL(fentry_nest3, "fentry-nest3");
+BENCH_TRIG_KERNEL(rawtp_nest3, "rawtp-nest3");
 
 /* uprobe benchmarks */
 #define BENCH_TRIG_USERMODE(KIND, PRODUCER, NAME)			\
