@@ -24,18 +24,18 @@
  *   B:            wakes up and preempts A, which is still inside the program
  *                 prctl() -> enters the same program on the same CPU
  *
- * A program whose recursion is checked per task runs for B too. A program that
- * keeps per-CPU state keeps the per-CPU check: B's run is dropped and counted
- * as a recursion miss.
+ * A program without per-CPU state runs for B too, while A is preempted inside
+ * it. A program with per-CPU state runs with preemption disabled: B wakes up
+ * only when A has left the program, and then runs it. A sleepable program has
+ * to disable preemption itself, so B runs inside it too.
  */
 
 /* The per-CPU state that a program touches, see progs/trampoline_preempt.c */
 enum { NO_PERCPU, PERCPU_MAP, PERCPU_VAR, THIS_CPU_PTR };
 
 enum expect {
-	B_RUNS,		/* B runs the program, without recursion misses */
-	B_DROPPED,	/* B's runs are dropped and counted as recursion misses */
-	B_RUNS_HANDLER,	/* two_dispatchers: dropped by one dispatcher, runs through the other */
+	B_RUNS,		/* B runs the program while A is preempted inside it */
+	B_AFTER,	/* B runs the program after A has left it */
 };
 
 /* What threads A and B share */
@@ -45,18 +45,6 @@ struct ctx {
 	int cpu, err_a, err_b;
 	int overlaps;	/* rounds in which B found A still inside the program */
 };
-
-/* Only timed may_goto keeps its budget per CPU, and only these JITs have it */
-static bool has_timed_may_goto(void)
-{
-#if defined(__x86_64__) || defined(__aarch64__) || defined(__s390x__) || \
-	defined(__powerpc64__) || (defined(__riscv) && __riscv_xlen == 64) || \
-	(defined(__loongarch__) && __loongarch_grlen == 64)
-	return is_jit_enabled();
-#else
-	return false;
-#endif
-}
 
 static int pin_to_cpu(int cpu)
 {
@@ -150,22 +138,23 @@ static const struct subtest {
 } subtests[] = {
 	/* Each kind of program, without per-CPU state and with a per-CPU map lookup */
 	{ "fentry",		"on_fentry",		NO_PERCPU,	B_RUNS },
-	{ "fentry_percpu",	"on_fentry",		PERCPU_MAP,	B_DROPPED },
+	{ "fentry_percpu",	"on_fentry",		PERCPU_MAP,	B_AFTER },
 	{ "fentry_s",		"on_fentry_s",		NO_PERCPU,	B_RUNS },
-	{ "fentry_s_percpu",	"on_fentry_s",		PERCPU_MAP,	B_DROPPED },
+	{ "fentry_s_percpu",	"on_fentry_s",		PERCPU_MAP,	B_RUNS },
 	{ "raw_tp",		"on_raw_tp",		NO_PERCPU,	B_RUNS },
-	{ "raw_tp_percpu",	"on_raw_tp",		PERCPU_MAP,	B_DROPPED },
+	{ "raw_tp_percpu",	"on_raw_tp",		PERCPU_MAP,	B_AFTER },
 	{ "raw_tp_s",		"on_raw_tp_s",		NO_PERCPU,	B_RUNS },
-	{ "raw_tp_s_percpu",	"on_raw_tp_s",		PERCPU_MAP,	B_DROPPED },
+	{ "raw_tp_s_percpu",	"on_raw_tp_s",		PERCPU_MAP,	B_RUNS },
 	{ "tp_syscall",		"on_tp_syscall",	NO_PERCPU,	B_RUNS },
-	{ "tp_syscall_percpu",	"on_tp_syscall",	PERCPU_MAP,	B_DROPPED },
-	/* The other things that keep a program on the per-CPU check */
-	{ "percpu_var",		"on_raw_tp",		PERCPU_VAR,	B_DROPPED },
-	{ "this_cpu_ptr",	"on_raw_tp",		THIS_CPU_PTR,	B_DROPPED },
-	{ "tail_call",		"on_tail_call",		NO_PERCPU,	B_DROPPED },
-	{ "may_goto",		"on_may_goto",		NO_PERCPU,	B_DROPPED },
-	/* Both threads are inside the handler at once, and A's stack must stay intact */
-	{ "two_dispatchers",	"dispatcher_a",		NO_PERCPU,	B_RUNS_HANDLER,
+	{ "tp_syscall_percpu",	"on_tp_syscall",	PERCPU_MAP,	B_AFTER },
+	/* The other things that mark a program */
+	{ "percpu_var",		"on_raw_tp",		PERCPU_VAR,	B_AFTER },
+	{ "this_cpu_ptr",	"on_raw_tp",		THIS_CPU_PTR,	B_AFTER },
+	{ "tail_call",		"on_tail_call",		NO_PERCPU,	B_AFTER },
+	/* Its budget is saved and restored around B's run: it needs no per-CPU exclusion */
+	{ "may_goto",		"on_may_goto",		NO_PERCPU,	B_RUNS },
+	/* B reaches the handler through the other dispatcher, after A, and A's stack stays intact */
+	{ "two_dispatchers",	"dispatcher_a",		NO_PERCPU,	B_AFTER,
 	  "dispatcher_b", "handler" },
 };
 
@@ -178,10 +167,6 @@ static void run_subtest(const struct subtest *t)
 	pthread_t ta, tb;
 	int err, fd;
 
-	if (!strcmp(t->name, "may_goto") && !has_timed_may_goto()) {
-		test__skip();
-		return;
-	}
 	c.skel = load_progs(t->prog, t->prog_b, t->handler, t->percpu);
 	if (!c.skel)
 		return;
@@ -218,25 +203,21 @@ static void run_subtest(const struct subtest *t)
 	ASSERT_OK(c.err_a, "worker_a");
 	ASSERT_OK(c.err_b, "worker_b");
 	ASSERT_EQ(c.skel->bss->sig_err, 0, "sig_err");
-	if (!c.overlaps) {
+	if (t->expect == B_RUNS && !c.overlaps) {
 		/* B never preempted A inside the program, so nothing was tested */
 		test__skip();
 		goto out;
 	}
-	ASSERT_EQ(c.overlaps, NR_ROUNDS, "overlaps");
+	ASSERT_EQ(c.overlaps, t->expect == B_RUNS ? NR_ROUNDS : 0, "overlaps");
 	ASSERT_EQ(c.skel->bss->runs_a, NR_ROUNDS, "runs_a");
-	ASSERT_EQ(c.skel->bss->runs_b, t->expect == B_DROPPED ? 0 : NR_ROUNDS, "runs_b");
+	ASSERT_EQ(c.skel->bss->runs_b, NR_ROUNDS, "runs_b");
 	if (t->handler)
 		ASSERT_EQ(c.skel->bss->stack_corrupt, 0, "stack_corrupt");
 	fd = bpf_program__fd(bpf_object__find_program_by_name(c.skel->obj, t->prog));
 	err = bpf_prog_get_info_by_fd(fd, &info, &info_len);
 	if (!ASSERT_OK(err, "prog_info"))
 		goto out;
-	/* A program on sys_enter also misses B's other syscalls: at least one miss per round */
-	if (t->expect == B_RUNS)
-		ASSERT_EQ(info.recursion_misses, 0, "recursion_misses");
-	else
-		ASSERT_GE(info.recursion_misses, NR_ROUNDS, "recursion_misses");
+	ASSERT_EQ(info.recursion_misses, 0, "recursion_misses");
 out:
 	trampoline_preempt__destroy(c.skel);
 }
