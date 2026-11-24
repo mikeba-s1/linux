@@ -1055,6 +1055,14 @@ void __noreturn make_task_dead(int signr)
 		preempt_count_set(PREEMPT_ENABLED);
 	}
 
+#ifdef CONFIG_BPF_SYSCALL
+	/*
+	 * The frames of the BPF programs that the task ran are gone: the stack
+	 * may be rewound already. Nothing may walk them on the way out.
+	 */
+	tsk->bpf_ctx = NULL;
+#endif
+
 	/*
 	 * Every time the system oopses, if the oops happens while a reference
 	 * to an object was held, the reference leaks.
