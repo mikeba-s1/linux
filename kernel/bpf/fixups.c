@@ -2591,7 +2591,6 @@ int bpf_do_misc_fixups(struct bpf_verifier_env *env)
 				if (!tmg)
 					return -ENOMEM;
 				prog->aux->timed_may_goto = tmg;
-				prog->recur_per_cpu = true;
 			}
 			prog->jit_required = 1;
 			cnt = may_goto_expand_timed(insn_buf, &jmp, tmg, reg, save_off);
@@ -3188,7 +3187,12 @@ next_insn:
 				insn_buf[cnt++] = BPF_ST_MEM(BPF_DW, BPF_REG_0, count_off,
 							     BPF_MAX_TIMED_LOOPS);
 				insn_buf[cnt++] = BPF_ST_MEM(BPF_DW, BPF_REG_0, timestamp_off, 0);
-				insn_buf[cnt++] = BPF_ST_MEM(BPF_DW, BPF_REG_0, owner_off, 0);
+				/*
+				 * bpf_prog_enter_run_ctx() has saved the budget of a run that
+				 * this one may have preempted, and set owner to get it back.
+				 */
+				if (!bpf_prog_enters_run_ctx(prog))
+					insn_buf[cnt++] = BPF_ST_MEM(BPF_DW, BPF_REG_0, owner_off, 0);
 			} else {
 				/*
 				 * The time is up, but the helper would call the function again and

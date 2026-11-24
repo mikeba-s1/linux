@@ -2064,7 +2064,7 @@ struct bpf_prog {
 				call_session_cookie:1, /* Do we call bpf_session_cookie() */
 				tstamp_type_access:1, /* Accessed __sk_buff->tstamp_type */
 				sleepable:1,	/* BPF program is sleepable */
-				recur_per_cpu:1; /* Runs must not overlap on a CPU */
+				percpu_state:1; /* Runs must not overlap on a CPU */
 	enum bpf_prog_type	type;		/* Type of BPF program */
 	enum bpf_attach_type	expected_attach_type; /* For some prog types */
 	u32			len;		/* Number of filter blocks */
@@ -2784,13 +2784,27 @@ int bpf_prog_array_copy(struct bpf_prog_array *old_array,
 struct bpf_prog *bpf_prog_dummy(void);
 
 /*
+ * Per-cpu memory of a prog. All may_goto of one invocation of the prog use it. An invocation is
+ * one call from the kernel into the main prog, with the subprogs and sync callbacks it reaches.
+ */
+struct bpf_timed_may_goto {
+	u64 count;
+	u64 timestamp;
+	/* the caller that has set count and timestamp, see bpf_timed_may_goto_save() */
+	void *owner;
+};
+
+void bpf_timed_may_goto_save(const struct bpf_prog *prog, struct bpf_timed_may_goto *saved);
+void bpf_timed_may_goto_restore(const struct bpf_prog *prog, struct bpf_timed_may_goto *saved);
+
+/*
  * A frame in the chain of the programs that a task is running, from
  * current->bpf_ctx to the outermost one.
  */
 struct bpf_run_ctx {
 	/* The next outer frame, NULL in the outermost one */
 	struct bpf_run_ctx *saved_run_ctx;
-	/* Set while a program whose recursion is checked per task runs in the frame */
+	/* The program that runs in the frame, see bpf_prog_enter_run_ctx() */
 	const struct bpf_prog *prog;
 };
 
@@ -2810,6 +2824,8 @@ struct bpf_tramp_run_ctx {
 	struct bpf_run_ctx run_ctx;
 	u64 bpf_cookie;
 	int retval;
+	/* The may_goto budget of a preempted run, see bpf_prog_enter_run_ctx() */
+	struct bpf_timed_may_goto tmg;
 };
 
 static inline struct bpf_run_ctx *bpf_set_run_ctx(struct bpf_run_ctx *new_ctx)
@@ -2842,57 +2858,51 @@ static inline void bpf_reset_run_ctx(struct bpf_run_ctx *old_ctx)
 }
 
 /*
- * Enter @prog, unless that would be recursion:
+ * Run @prog in @run_ctx, which bpf_set_run_ctx() has linked into the chain of
+ * the current task, unless that would be recursion: a frame further out runs
+ * @prog already. Interrupts and NMIs run on top of the chain of the task they
+ * interrupt, so recursion through them is caught too.
  *
- * - A program that keeps per-CPU state (prog->recur_per_cpu) takes the per-CPU
- *   counter. No other run of it starts on this CPU until it exits.
- * - Any other program recurses only if the current task is already inside it:
- *   a frame in the task's chain runs it. Interrupts and NMIs run on top of the
- *   chain of the task they interrupt, so they are covered too.
+ * A program with per-CPU state (prog->percpu_state) runs with preemption
+ * disabled, so that no other run of it starts on this CPU before it exits. A
+ * sleepable one has to use bpf_preempt_disable() itself.
+ *
+ * The may_goto budget is per CPU. It is saved in @tmg and given back by
+ * bpf_prog_exit_run_ctx(), so that a run of @prog doesn't renew the budget of
+ * a run that it preempted.
  *
  * Returns false if @prog must not run. Call bpf_prog_exit_run_ctx() either way.
- *
- * The chain is walked before the frame is linked, so a run that must not start
- * links nothing. Always inline: the callers are notrace.
+ * Always inline: the callers are notrace.
  */
 static __always_inline bool bpf_prog_enter_run_ctx(struct bpf_prog *prog,
-						   struct bpf_run_ctx *run_ctx)
+						   struct bpf_run_ctx *run_ctx,
+						   struct bpf_timed_may_goto *tmg)
 {
-	struct bpf_run_ctx *old_ctx = NULL;
+	struct bpf_run_ctx *ctx;
 
-#ifdef CONFIG_BPF_SYSCALL
-	old_ctx = READ_ONCE(current->bpf_ctx);
-#endif
-	run_ctx->saved_run_ctx = old_ctx;
-	if (prog->recur_per_cpu) {
-		run_ctx->prog = NULL;
-		if (!bpf_prog_get_recursion_context(prog))
+	WRITE_ONCE(run_ctx->prog, prog);
+	if (prog->percpu_state && !prog->sleepable)
+		preempt_disable_notrace();
+	if (unlikely(prog->aux->timed_may_goto))
+		bpf_timed_may_goto_save(prog, tmg);
+	for (ctx = run_ctx->saved_run_ctx; ctx; ctx = READ_ONCE(ctx->saved_run_ctx)) {
+		if (READ_ONCE(ctx->prog) == prog) {
+			WRITE_ONCE(run_ctx->prog, NULL);
 			return false;
-	} else {
-		for (struct bpf_run_ctx *ctx = old_ctx; ctx; ctx = ctx->saved_run_ctx) {
-			if (READ_ONCE(ctx->prog) == prog)
-				return false;
 		}
-		run_ctx->prog = prog;
 	}
-#ifdef CONFIG_BPF_SYSCALL
-	/* Initialize the frame before interrupts and NMIs on this CPU see it. */
-	barrier();
-	WRITE_ONCE(current->bpf_ctx, run_ctx);
-#endif
 	return true;
 }
 
-/*
- * Also correct after an enter that returned false: the frame was not linked,
- * so resetting to its saved_run_ctx changes nothing.
- */
 static __always_inline void bpf_prog_exit_run_ctx(struct bpf_prog *prog,
-						  struct bpf_run_ctx *run_ctx)
+						  struct bpf_run_ctx *run_ctx,
+						  struct bpf_timed_may_goto *tmg)
 {
-	bpf_reset_run_ctx(run_ctx->saved_run_ctx);
-	if (prog->recur_per_cpu)
-		bpf_prog_put_recursion_context(prog);
+	if (unlikely(prog->aux->timed_may_goto))
+		bpf_timed_may_goto_restore(prog, tmg);
+	if (prog->percpu_state && !prog->sleepable)
+		preempt_enable_notrace();
+	WRITE_ONCE(run_ctx->prog, NULL);
 }
 
 /* BPF program asks to bypass CAP_NET_BIND_SERVICE in bind. */
@@ -3565,7 +3575,9 @@ bpf_prog_run_array_sleepable(const struct bpf_prog_array *array,
 {
 	const struct bpf_prog_array_item *item;
 	struct bpf_prog *prog;
+	struct bpf_run_ctx *old_run_ctx;
 	struct bpf_trace_run_ctx run_ctx;
+	struct bpf_timed_may_goto tmg;
 	u32 ret = 1;
 
 	if (unlikely(!array))
@@ -3575,6 +3587,7 @@ bpf_prog_run_array_sleepable(const struct bpf_prog_array *array,
 
 	run_ctx.is_uprobe = false;
 
+	old_run_ctx = bpf_set_run_ctx(&run_ctx.run_ctx);
 	item = &array->items[0];
 	while ((prog = READ_ONCE(item->prog))) {
 		/* Skip dummy_bpf_prog placeholder (len == 0) */
@@ -3584,9 +3597,9 @@ bpf_prog_run_array_sleepable(const struct bpf_prog_array *array,
 		}
 
 		run_ctx.bpf_cookie = item->bpf_cookie;
-		if (unlikely(!bpf_prog_enter_run_ctx(prog, &run_ctx.run_ctx))) {
+		if (unlikely(!bpf_prog_enter_run_ctx(prog, &run_ctx.run_ctx, &tmg))) {
 			bpf_prog_inc_misses_counter(prog);
-			bpf_prog_exit_run_ctx(prog, &run_ctx.run_ctx);
+			bpf_prog_exit_run_ctx(prog, &run_ctx.run_ctx, &tmg);
 			item++;
 			continue;
 		}
@@ -3598,9 +3611,10 @@ bpf_prog_run_array_sleepable(const struct bpf_prog_array *array,
 			ret &= run_prog(prog, ctx);
 		}
 
-		bpf_prog_exit_run_ctx(prog, &run_ctx.run_ctx);
+		bpf_prog_exit_run_ctx(prog, &run_ctx.run_ctx, &tmg);
 		item++;
 	}
+	bpf_reset_run_ctx(old_run_ctx);
 	migrate_enable();
 	return ret;
 }

@@ -3850,11 +3850,11 @@ static int bpf_tracing_prog_attach(struct bpf_prog *prog,
 		goto out_unlock;
 	}
 	/*
-	 * An extension runs under the recursion check of its target. One that
-	 * keeps per-CPU state relies on its runs not overlapping on a CPU, which
-	 * a target whose recursion is checked per task doesn't provide.
+	 * An extension runs in the run of its target. One that keeps per-CPU
+	 * state relies on its runs not overlapping on a CPU, which a target that
+	 * runs preemptibly doesn't provide.
 	 */
-	if (prog->type == BPF_PROG_TYPE_EXT && prog->recur_per_cpu &&
+	if (prog->type == BPF_PROG_TYPE_EXT && prog->percpu_state &&
 	    bpf_prog_recur_per_task(tgt_prog)) {
 		err = -EINVAL;
 		goto out_unlock;
