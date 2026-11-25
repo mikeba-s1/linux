@@ -2169,6 +2169,7 @@ void __bpf_trace_run(struct bpf_raw_tp_link *link, u64 *args)
 	bool sleepable = prog->sleepable;
 	struct bpf_run_ctx *old_run_ctx;
 	struct bpf_trace_run_ctx run_ctx;
+	struct bpf_timed_may_goto tmg;
 
 	if (sleepable) {
 		scp = rcu_read_lock_tasks_trace();
@@ -2179,14 +2180,14 @@ void __bpf_trace_run(struct bpf_raw_tp_link *link, u64 *args)
 
 	run_ctx.bpf_cookie = link->cookie;
 	old_run_ctx = bpf_set_run_ctx(&run_ctx.run_ctx);
-	if (unlikely(!bpf_prog_enter_run_ctx(prog, &run_ctx.run_ctx))) {
+	if (unlikely(!bpf_prog_enter_run_ctx(prog, &run_ctx.run_ctx, &tmg))) {
 		bpf_prog_inc_misses_counter(prog);
 		goto out;
 	}
 
 	(void)bpf_prog_run(prog, args);
 out:
-	bpf_prog_exit_run_ctx(prog, &run_ctx.run_ctx);
+	bpf_prog_exit_run_ctx(prog, &run_ctx.run_ctx, &tmg);
 	bpf_reset_run_ctx(old_run_ctx);
 
 	if (sleepable) {

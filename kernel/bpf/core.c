@@ -4047,11 +4047,13 @@ u64 bpf_check_timed_may_goto(struct bpf_timed_may_goto *p)
  * The main prog sets count and timestamp in its first insns. A call of an async callback is an
  * invocation of its own too, but it can interrupt an invocation of the prog on this cpu, or go on
  * next to one that is preempted. So its caller sets count and timestamp, and puts the old ones
- * back at the end. Not when another invocation has set them in the meantime: they are for that
- * one now.
+ * back at the end. bpf_prog_enter_run_ctx() does the same for a run that can preempt another
+ * one. Not when another invocation has set them in the meantime: they are for that one now.
  * The caller has disabled migration.
  */
-void bpf_timed_may_goto_save(const struct bpf_prog *prog, struct bpf_timed_may_goto *saved)
+/* notrace: bpf_prog_enter_run_ctx() calls it before the program runs */
+void notrace bpf_timed_may_goto_save(const struct bpf_prog *prog,
+				     struct bpf_timed_may_goto *saved)
 {
 	struct bpf_timed_may_goto *cur;
 
@@ -4064,7 +4066,8 @@ void bpf_timed_may_goto_save(const struct bpf_prog *prog, struct bpf_timed_may_g
 	cur->owner = saved;
 }
 
-void bpf_timed_may_goto_restore(const struct bpf_prog *prog, struct bpf_timed_may_goto *saved)
+void notrace bpf_timed_may_goto_restore(const struct bpf_prog *prog,
+					struct bpf_timed_may_goto *saved)
 {
 	struct bpf_timed_may_goto *cur;
 
