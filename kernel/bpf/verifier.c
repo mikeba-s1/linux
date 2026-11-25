@@ -5339,7 +5339,8 @@ static enum priv_stack_mode bpf_enable_priv_stack(struct bpf_prog *prog)
 	 * program attached to both a syscall and a regular tracepoint. They always
 	 * use the task's kernel stack. Kprobe multi, kprobe session and perf_event
 	 * programs are serialized per CPU by bpf_prog_active, and struct_ops
-	 * programs that request a private stack keep per-CPU recursion protection.
+	 * programs that request a private stack run with preemption disabled, see
+	 * bpf_prog_enter_run_ctx().
 	 */
 	switch (prog->type) {
 	case BPF_PROG_TYPE_KPROBE:

@@ -3850,6 +3850,16 @@ static int bpf_tracing_prog_attach(struct bpf_prog *prog,
 		goto out_unlock;
 	}
 	/*
+	 * An extension runs in the run of its target. One that keeps per-CPU
+	 * state relies on its runs not overlapping on a CPU, which a target that
+	 * runs preemptibly doesn't provide.
+	 */
+	if (prog->type == BPF_PROG_TYPE_EXT && prog->percpu_state &&
+	    bpf_prog_recur_per_task(tgt_prog)) {
+		err = -EINVAL;
+		goto out_unlock;
+	}
+	/*
 	 * The size of these contexts depends on what the program is attached
 	 * to, or run with. That is compared with max_ctx_offset of the program,
 	 * and nobody looks at the one of its extensions.
