@@ -1827,6 +1827,29 @@ static inline bool bpf_prog_check_recur(const struct bpf_prog *prog)
 	}
 }
 
+/* Is @prog run through bpf_prog_enter_run_ctx()? */
+static inline bool bpf_prog_enters_run_ctx(const struct bpf_prog *prog)
+{
+	switch (resolve_prog_type(prog)) {
+	case BPF_PROG_TYPE_RAW_TRACEPOINT:
+	case BPF_PROG_TYPE_RAW_TRACEPOINT_WRITABLE:
+	/* It may be attached to a syscall tracepoint */
+	case BPF_PROG_TYPE_TRACEPOINT:
+		return true;
+	case BPF_PROG_TYPE_TRACING:
+	case BPF_PROG_TYPE_STRUCT_OPS:
+		return bpf_prog_check_recur(prog);
+	default:
+		return false;
+	}
+}
+
+/* Can two tasks run @prog at once on a CPU: it is checked per task and runs preemptibly? */
+static inline bool bpf_prog_recur_per_task(const struct bpf_prog *prog)
+{
+	return !prog->percpu_state && bpf_prog_enters_run_ctx(prog);
+}
+
 #define BPF_REG_TRUSTED_MODIFIERS (MEM_ALLOC | PTR_TRUSTED | NON_OWN_REF)
 
 static inline bool bpf_type_has_unsafe_modifiers(u32 type)
