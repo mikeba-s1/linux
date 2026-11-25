@@ -2784,6 +2784,24 @@ int bpf_prog_array_copy(struct bpf_prog_array *old_array,
 struct bpf_prog *bpf_prog_dummy(void);
 
 /*
+ * Per-cpu memory of a prog. All may_goto of one invocation of the prog use it. An invocation is
+ * one call from the kernel into the main prog, with the subprogs and sync callbacks it reaches.
+ */
+struct bpf_timed_may_goto {
+	u64 count;
+	u64 timestamp;
+	/* the async callback that has set count and timestamp, see bpf_timed_may_goto_save() */
+	void *owner;
+	/* runs of the prog in progress here, see bpf_timed_may_goto_enter() */
+	u64 runs;
+};
+
+void bpf_timed_may_goto_save(const struct bpf_prog *prog, struct bpf_timed_may_goto *saved);
+void bpf_timed_may_goto_restore(const struct bpf_prog *prog, struct bpf_timed_may_goto *saved);
+void bpf_timed_may_goto_enter(const struct bpf_prog *prog);
+void bpf_timed_may_goto_exit(const struct bpf_prog *prog);
+
+/*
  * A frame in the chain of the programs that a task is running, from
  * current->bpf_ctx to the outermost one.
  */
@@ -2851,6 +2869,9 @@ static inline void bpf_reset_run_ctx(struct bpf_run_ctx *old_ctx)
  * disabled, so that no other run of it starts on this CPU before it exits. A
  * sleepable one has to use bpf_preempt_disable() itself.
  *
+ * The runs of @prog in progress on this CPU share one may_goto time slice, see
+ * bpf_timed_may_goto_enter().
+ *
  * Returns false if @prog must not run. Call bpf_prog_exit_run_ctx() either way.
  * Always inline: the callers are notrace.
  */
@@ -2862,6 +2883,8 @@ static __always_inline bool bpf_prog_enter_run_ctx(struct bpf_prog *prog,
 	WRITE_ONCE(run_ctx->prog, prog);
 	if (prog->percpu_state && !prog->sleepable)
 		preempt_disable_notrace();
+	if (unlikely(prog->aux->timed_may_goto))
+		bpf_timed_may_goto_enter(prog);
 	for (ctx = run_ctx->saved_run_ctx; unlikely(ctx); ctx = READ_ONCE(ctx->saved_run_ctx)) {
 		if (READ_ONCE(ctx->prog) == prog) {
 			WRITE_ONCE(run_ctx->prog, NULL);
@@ -2874,6 +2897,8 @@ static __always_inline bool bpf_prog_enter_run_ctx(struct bpf_prog *prog,
 static __always_inline void bpf_prog_exit_run_ctx(struct bpf_prog *prog,
 						  struct bpf_run_ctx *run_ctx)
 {
+	if (unlikely(prog->aux->timed_may_goto))
+		bpf_timed_may_goto_exit(prog);
 	if (prog->percpu_state && !prog->sleepable)
 		preempt_enable_notrace();
 	WRITE_ONCE(run_ctx->prog, NULL);

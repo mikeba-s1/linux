@@ -80,7 +80,7 @@ __naked void may_goto_batch_1(void)
 	: __clobber_all);
 }
 
-SEC("raw_tp")
+SEC("tc")
 __description("may_goto batch with offsets 2/0")
 __load_if_JITed()
 __arch_x86_64
@@ -109,6 +109,53 @@ __xlated("17: r0 = 2")
 __xlated("18: exit")
 __success
 __naked void may_goto_batch_2(void)
+{
+	asm volatile (
+	".8byte %[may_goto1];"
+	".8byte %[may_goto3];"
+	"r0 = 1;"
+	"r0 = 2;"
+	"exit;"
+	:
+	: __imm_insn(may_goto1, BPF_RAW_INSN(BPF_JMP | BPF_JCOND, 0, 0, 2 /* offset */, 0)),
+	  __imm_insn(may_goto3, BPF_RAW_INSN(BPF_JMP | BPF_JCOND, 0, 0, 0 /* offset */, 0))
+	: __clobber_all);
+}
+
+SEC("raw_tp")
+__description("may_goto prologue of a prog with counted runs")
+__load_if_JITed()
+__arch_x86_64
+__arch_s390x
+__arch_arm64
+__arch_riscv64
+__arch_loongarch
+/*
+ * The runner counts the runs of a raw_tp prog. The main prog sets count,
+ * timestamp, owner only when no run is in progress: a tail call into it.
+ */
+__xlated("0: r0 = ")
+__xlated("2: r0 = &(void __percpu *)(r0)")
+__xlated("3: r2 = *(u64 *)(r0 +24)")
+__xlated("4: if r2 != 0x0 goto pc+3")
+__xlated("5: *(u64 *)(r0 +0) = 65535")
+__xlated("6: *(u64 *)(r0 +8) = 0")
+__xlated("7: *(u64 *)(r0 +16) = 0")
+/* may_goto, r0 is dead */
+__xlated("8: r0 = ")
+__xlated("10: r0 = &(void __percpu *)(r0)")
+__xlated("11: r13 = *(u64 *)(r0 +0)")
+__xlated("12: if r13 == 0x0 goto pc+6")
+__xlated("13: r13 -= 1")
+__xlated("14: if r13 != 0x0 goto pc+2")
+__xlated("15: r13 = r0")
+__xlated("16: call unknown")
+__xlated("17: *(u64 *)(r0 +0) = r13")
+__xlated("18: r0 = 1")
+__xlated("19: r0 = 2")
+__xlated("20: exit")
+__success
+__naked void may_goto_counted_runs(void)
 {
 	asm volatile (
 	".8byte %[may_goto1];"

@@ -900,7 +900,8 @@ __naked void unconditional_jump_to_fill(void)
 	: __clobber_all);
 }
 
-SEC("raw_tp")
+/* tc: the runner of tracing programs changes the prologue, see verifier_may_goto_1.c */
+SEC("tc")
 __arch_x86_64
 __log_level(4)
 __msg("subprog 0 (may_goto_interaction_x86_64) main {{.*}} stack 8")
@@ -943,7 +944,7 @@ __naked void may_goto_interaction_x86_64(void)
 	: __clobber_all);
 }
 
-SEC("raw_tp")
+SEC("tc")
 __arch_arm64
 __arch_riscv64
 __arch_loongarch

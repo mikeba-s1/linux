@@ -2591,7 +2591,6 @@ int bpf_do_misc_fixups(struct bpf_verifier_env *env)
 				if (!tmg)
 					return -ENOMEM;
 				prog->aux->timed_may_goto = tmg;
-				prog->percpu_state = true;
 			}
 			prog->jit_required = 1;
 			cnt = may_goto_expand_timed(insn_buf, &jmp, tmg, reg, save_off);
@@ -3179,12 +3178,27 @@ next_insn:
 			int count_off = offsetof(struct bpf_timed_may_goto, count);
 			int timestamp_off = offsetof(struct bpf_timed_may_goto, timestamp);
 			int owner_off = offsetof(struct bpf_timed_may_goto, owner);
+			int runs_off = offsetof(struct bpf_timed_may_goto, runs);
 
 			/* R0 has nothing at the entry */
 			insn_buf[cnt++] = ld_tmg[0];
 			insn_buf[cnt++] = ld_tmg[1];
 			insn_buf[cnt++] = BPF_MOV64_PERCPU_REG(BPF_REG_0, BPF_REG_0);
 			if (main_prog) {
+				/*
+				 * Runs that bpf_prog_enter_run_ctx() let in share one time
+				 * slice, see bpf_timed_may_goto_enter(). Leave it alone while
+				 * runs are in progress: this is one of them, or a tail call
+				 * into the prog on top of them. R2-R5 have nothing at the entry
+				 * of a main prog. An extension has arguments there, and its
+				 * runs are not counted: it always starts a slice.
+				 */
+				if (bpf_prog_enters_run_ctx(prog) &&
+				    prog->type != BPF_PROG_TYPE_EXT) {
+					insn_buf[cnt++] = BPF_LDX_MEM(BPF_DW, BPF_REG_2, BPF_REG_0,
+								      runs_off);
+					insn_buf[cnt++] = BPF_JMP_IMM(BPF_JNE, BPF_REG_2, 0, 3);
+				}
 				insn_buf[cnt++] = BPF_ST_MEM(BPF_DW, BPF_REG_0, count_off,
 							     BPF_MAX_TIMED_LOOPS);
 				insn_buf[cnt++] = BPF_ST_MEM(BPF_DW, BPF_REG_0, timestamp_off, 0);

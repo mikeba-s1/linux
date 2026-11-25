@@ -4058,7 +4058,10 @@ void bpf_timed_may_goto_save(const struct bpf_prog *prog, struct bpf_timed_may_g
 	if (!prog->aux->timed_may_goto)
 		return;
 	cur = this_cpu_ptr(prog->aux->timed_may_goto);
-	*saved = *cur;
+	/* not runs: that counts the runs that bpf_timed_may_goto_enter() let in */
+	saved->count = cur->count;
+	saved->timestamp = cur->timestamp;
+	saved->owner = cur->owner;
 	cur->count = BPF_MAX_TIMED_LOOPS;
 	cur->timestamp = 0;
 	cur->owner = saved;
@@ -4071,8 +4074,38 @@ void bpf_timed_may_goto_restore(const struct bpf_prog *prog, struct bpf_timed_ma
 	if (!prog->aux->timed_may_goto)
 		return;
 	cur = this_cpu_ptr(prog->aux->timed_may_goto);
-	if (cur->owner == saved)
-		*cur = *saved;
+	if (cur->owner == saved) {
+		cur->count = saved->count;
+		cur->timestamp = saved->timestamp;
+		cur->owner = saved->owner;
+	}
+}
+
+/*
+ * notrace: bpf_prog_enter_run_ctx() and bpf_prog_exit_run_ctx() call these two.
+ *
+ * The runs of a prog that bpf_prog_enter_run_ctx() lets in can overlap on a cpu: one preempts
+ * another, and either may go on first. They share count and timestamp. Only a run that finds no
+ * other one in progress here starts a new time slice, so that no run renews the slice of another.
+ * The first insns of the prog leave count and timestamp alone while runs are in progress, see
+ * bpf_do_misc_fixups(). Nor does a run start a slice while an async callback of the prog is on
+ * this cpu: it uses the slice of the callback.
+ */
+void notrace bpf_timed_may_goto_enter(const struct bpf_prog *prog)
+{
+	struct bpf_timed_may_goto __percpu *tmg = prog->aux->timed_may_goto;
+
+	preempt_disable_notrace();
+	if (this_cpu_inc_return(tmg->runs) == 1 && !this_cpu_read(tmg->owner)) {
+		this_cpu_write(tmg->count, BPF_MAX_TIMED_LOOPS);
+		this_cpu_write(tmg->timestamp, 0);
+	}
+	preempt_enable_notrace();
+}
+
+void notrace bpf_timed_may_goto_exit(const struct bpf_prog *prog)
+{
+	this_cpu_dec(prog->aux->timed_may_goto->runs);
 }
 
 /* for configs without MMU or 32-bit */
